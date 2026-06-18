@@ -464,11 +464,11 @@ def inflate_sample_table_video(data, multiplier=5):
 
     stts_delta = len(new_stts) - stts_sz
     stsz_delta = len(new_stsz) - stsz_sz
-    stco_delta = fake_count * 4
+    stco_delta = (total_count - orig_stco_count) * 4
     stsc_delta = 0  # no extra entry — stsc unchanged
     moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
 
-    new_stco_count = orig_stco_count + fake_count
+    new_stco_count = total_count  # one entry per total frame (interleaved)
 
     # Keep original stsc as-is — all chunks have 1 sample, no extra entry needed
     stsc_entry_count = int.from_bytes(data[stsc_off+12:stsc_off+16], 'big')
