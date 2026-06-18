@@ -673,6 +673,22 @@ def patch_audio_duration(data, original_duration):
     return data
 
 
+# ── Free Box Padding (bitrate inflation) ────────────────────────────────
+
+def add_padding_free(data, padding_mb=50):
+    """Append a 'free' box with zero padding to inflate file size.
+    TikTok may see the inflated size as 'already high bitrate' and skip re-encode.
+    """
+    padding_bytes = padding_mb * 1024 * 1024
+    box_size = 8 + padding_bytes
+    buf = bytearray(box_size)
+    struct.pack_into('>I4s', buf, 0, box_size, b'free')
+    result = bytearray(len(data) + box_size)
+    result[:len(data)] = data
+    result[len(data):] = buf
+    return bytes(result)
+
+
 # ── Ftyp Brand Spoofing ─────────────────────────────────────────────────
 
 def patch_ftyp(data):
@@ -808,8 +824,8 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     if log_func:
         log_func("[TKHD] done")
 
-    # ── Pass 6a: Frame Count Inflation ────────────────────────────
     if use_inflation:
+        # ── Pass 6: Frame Count Inflation ────────────────────────────
         if log_func:
             log_func("")
             log_func("── 6/7  Frame Count Inflation (5x, non-interleaved, duration clip) ─────")
@@ -823,25 +839,17 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         data = inflated
         if log_func:
             log_func("[INFLATE] done")
-    
-    # ── Pass 6b: Brand / Codec Spoofing (always runs) ────────────
-    if log_func:
-        log_func("")
-    has_inflation = use_inflation
-    do_avc3 = not brand_spoof_only
-    if has_inflation and do_avc3:
-        label = "6b/7  Codec + Brand (avc1→avc3, M4VH)"
-    elif do_avc3:
-        label = "6b/7  Codec + Brand (avc1→avc3, M4VH)"
     else:
-        label = "6b/7  Brand Only (M4VH)"
-    if log_func:
-        log_func(f"── {label} ───────────────────────────────")
-    if do_avc3:
-        data = patch_stsd_codec(data)
-    data = patch_ftyp(data)
-    if log_func:
-        log_func(f"[PASS6b] {'avc3 + ' if do_avc3 else ''}M4VH done")
+        # ── Pass 6: Codec/Brand/Padding Spoofing ──────────────────
+        if log_func:
+            log_func("")
+            log_func("── 6/7  Codec + Brand + Size Padding ────────────────────────")
+        if not brand_spoof_only:
+            data = patch_stsd_codec(data)
+        data = patch_ftyp(data)
+        data = add_padding_free(data, padding_mb=50)
+        if log_func:
+            log_func("[SPOOF] done (avc3, M4VH, +50MB padding)")
     
     # ── Pass 7: Comment Udta Injection ───────────────────────────────────
     if log_func:
