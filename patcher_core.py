@@ -266,16 +266,62 @@ def fingerprint_tkhd(data):
     return bytes(p)
 
 
-# ── Frame Density Inflation (5x, single stts entry, duration-preserving) ─
+# ── Frame Density Inflation (5x, avcC bump + single-entry stts) ────────
 
 FILLER_NAL = b'\x00\x00\x00\x01\x0c\x00\x00\x80'
+
+def _bump_avcC_level(data):
+    """Raise avcC level from e.g. 5.1→6.2 so TikTok accepts higher fps from stts."""
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+    moov_end = moov_off + moov_sz
+    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_end):
+        _, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_sz == -1:
+            continue
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
+            continue
+        minf_off, minf_sz = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1:
+            continue
+        stbl_off, stbl_sz = _find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1:
+            continue
+        stsd_off, _ = _find_box(data, b"stsd", stbl_off+8, stbl_off+stbl_sz)
+        if stsd_off == -1:
+            continue
+        stsd_end = stsd_off + int.from_bytes(data[stsd_off:stsd_off+4], 'big')
+        entry_count = int.from_bytes(data[stsd_off+8:stsd_off+12], 'big')
+        pos = stsd_off + 12
+        for _ in range(entry_count):
+            if pos + 8 > stsd_end:
+                break
+            e_sz = int.from_bytes(data[pos:pos+4], 'big')
+            e_type = data[pos+4:pos+8]
+            if e_type == b'avc1':
+                avcC_off = data.find(b'avcC', pos+8, pos+e_sz)
+                if avcC_off != -1:
+                    p = bytearray(data)
+                    p[avcC_off+11] = 62  # 5.1 → 6.2
+                    return bytes(p)
+            pos += e_sz
+    return data
+
 
 def inflate_sample_table_video(data, multiplier=5):
     """Inflate sample count 5x in stsz+stts+stco+stsc.
     
-    Single-entry stts: new_delta = real_total_duration // total_count
-    so total playback duration matches the original — no frozen end.
+    Bumps avcC level to 6.2 so TikTok's framerate check passes for our
+    compressed stts delta.  Single-entry stts preserves original duration.
     """
+    # First bump avcC level
+    data = _bump_avcC_level(data)
+    
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
