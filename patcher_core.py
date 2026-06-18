@@ -696,7 +696,12 @@ def patch_ftyp(data):
     ftyp_off, ftyp_sz = _find_box(result, b"ftyp")
     if ftyp_off == -1:
         return data
+    # Overwrite major brand + first compatible brand
     result[ftyp_off+8:ftyp_off+12] = b'M4VH'
+    compat_off = ftyp_off + 16
+    compat_end = ftyp_off + ftyp_sz
+    if compat_off + 8 <= compat_end:
+        result[compat_off:compat_off+8] = b'M4VH' + b'M4VP'
     return bytes(result)
 
 
@@ -728,6 +733,42 @@ def patch_stsd_codec(data):
         entry_off = stsd_off + 16
         if result[entry_off+4:entry_off+8] == b'avc1':
             result[entry_off+4:entry_off+8] = b'avc3'
+    return bytes(result)
+
+
+# ── Stsd Bitrate Spoofing ──────────────────────────────────────────────
+
+def patch_stsd_bitrate(data, bitrate=100_000_000):
+    """Set a high bitrate in the video sample entry's btrt box (if present)."""
+    result = bytearray(data)
+    moov_off, moov_sz = _find_box(result, b"moov")
+    if moov_off == -1:
+        return data
+    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz):
+        mdia_off, mdia_sz = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(result, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1:
+            continue
+        if result[hdlr_off+16:hdlr_off+20] != b'vide':
+            continue
+        minf_off, minf_sz = _find_box(result, b"minf", mdia_off+8, mdia_off+minf_sz)
+        if minf_off == -1:
+            continue
+        stbl_off, stbl_sz = _find_box(result, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1:
+            continue
+        stsd_off, stsd_sz = _find_box(result, b"stsd", stbl_off+8, stbl_off+stbl_sz)
+        if stsd_off == -1:
+            continue
+        entry_off = stsd_off + 16
+        entry_sz = int.from_bytes(result[entry_off:entry_off+4], 'big')
+        entry_end = entry_off + entry_sz
+        btrt_off, btrt_sz = _find_box(result, b"btrt", entry_off+8, entry_end)
+        if btrt_off != -1:
+            struct.pack_into('>III', result, btrt_off+12, bitrate//8, bitrate, bitrate)
+            break
     return bytes(result)
 
 
@@ -840,16 +881,14 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         if log_func:
             log_func("[INFLATE] done")
     else:
-        # ── Pass 6: Codec/Brand/Padding Spoofing ──────────────────
+        # ── Pass 6: Brand + Bitrate Spoofing ───────────────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Codec + Brand + Size Padding ────────────────────────")
-        if not brand_spoof_only:
-            data = patch_stsd_codec(data)
+            log_func("── 6/7  Brand + Bitrate Spoofing ────────────────────────────")
         data = patch_ftyp(data)
-        data = add_padding_free(data, padding_mb=50)
+        data = patch_stsd_bitrate(data, 100_000_000)
         if log_func:
-            log_func("[SPOOF] done (avc3, M4VH, +50MB padding)")
+            log_func("[SPOOF] M4VH brand + 100Mbps bitrate")
     
     # ── Pass 7: Comment Udta Injection ───────────────────────────────────
     if log_func:
