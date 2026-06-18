@@ -769,13 +769,18 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         log_func(f"[READ] {len(data):,} bytes")
         _dump_atoms(data, "REBASE", log_func)
 
-    # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ────────────────
-    if log_func:
-        log_func("")
-        log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
-    data = rebuild_elst_bypass(data)
-    if log_func:
-        log_func("[ELST] done")
+    if use_inflation:
+        # ── Pass 2a: ZeroLoss Track Bypass (edts/elst) ─────────────────
+        if log_func:
+            log_func("")
+            log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
+        data = rebuild_elst_bypass(data)
+        if log_func:
+            log_func("[ELST] done")
+    else:
+        if log_func:
+            log_func("")
+            log_func("── 2/7  (skipped — no inflation mode)")
 
     # ── Pass 3: Subtle mvhd fingerprint ──────────────────────────────
     if log_func:
