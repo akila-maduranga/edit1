@@ -427,11 +427,15 @@ def inflate_sample_table_video(data, multiplier=5, original_size=None):
     if not real_offsets:
         return None
 
-    # Use filler NALs (no encode freeze, but needed for 5x count to prevent compression)
-    FILLER_NAL = b'\x00\x00\x00\x01\x0c\x80'
-    FILLER_NAL_SIZE = 512
-    filler_frame = FILLER_NAL + b'\x00' * (FILLER_NAL_SIZE - len(FILLER_NAL))
-    filler_data = filler_frame * fake_count
+    # Use filler NALs (type 0 = unspecified, ignored by decoders)
+    FILLER_NAL = b'\x00\x00\x00\x01\x00'
+    FILLER_NAL_SIZE = 64
+    filler_data = bytearray()
+    for i in range(fake_count):
+        frame = bytearray(FILLER_NAL_SIZE)
+        frame[:len(FILLER_NAL)] = FILLER_NAL
+        frame[5] = i & 0xFF  # vary one byte per frame to avoid duplicate detection
+        filler_data += frame
 
     # Non-interleaved stsz: all real, then all filler
     new_stsz_body = bytearray(20 + total_count * 4)
@@ -953,13 +957,6 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         data = inflated
         if log_func:
             log_func("[INFLATE] done")
-        # Loop elst to hide filler freeze (video repeats 5x, no freeze displayed)
-        if log_func:
-            log_func("")
-            log_func("── 6b/7  Elst Loop (hide filler freeze) ──────────────────────")
-        data = patch_elst_loop(data, loop_count=5)
-        if log_func:
-            log_func("[ELST_LOOP] done")
     else:
         # ── Pass 6: Brand + Bitrate Spoofing ───────────────────────
         if log_func:
