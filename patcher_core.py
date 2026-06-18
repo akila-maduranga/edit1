@@ -266,12 +266,15 @@ def fingerprint_tkhd(data):
     return bytes(p)
 
 
-# ── Frame Density Inflation (5x, avcC bump + single-entry stts) ────────
+# ── Frame Inflation (stsz-only + avcC profile bump) ────────────────────
 
 FILLER_NAL = b'\x00\x00\x00\x01\x0c\xff\x80'
 
-def _bump_avcC_level(data):
-    """Raise avcC level from e.g. 5.1→6.2 so TikTok accepts higher fps from stts."""
+def _patch_avcC_fingerprint(data):
+    """Change avcC profile (High→High10) and bump level to 6.2.
+    Makes encoder think this uses an unsupported profile → skip re-encode.
+    No stts/stco/stsc changes needed — no frozen end, no seek issues.
+    """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
@@ -303,21 +306,28 @@ def _bump_avcC_level(data):
                 avcC_off, _ = _find_box(data, b'avcC', pos+8, pos+e_sz)
                 if avcC_off != -1:
                     p = bytearray(data)
-                    old_level = p[avcC_off+11]
-                    p[avcC_off+11] = 62  # 5.1 → 6.2
+                    # Change profile from High(100) to High10(110)
+                    p[avcC_off+9] = 110
+                    # Clear profile_compat for High10
+                    p[avcC_off+10] = 0
+                    # Bump level from 5.1 to 6.2
+                    p[avcC_off+11] = 62
                     return bytes(p)
             pos += e_sz
     return data
 
 
 def inflate_sample_table_video(data, multiplier=5):
-    """Inflate sample count 5x in stsz+stts+stco+stsc.
-    
-    Two-entry stts — original delta for real frames, safe delta for fakes.
-    Bumps avcC level to 6.2 so TikTok allows the higher fake fps.
-    Stss stays correct because real frame indices are unchanged.
+    """Inflate stsz sample count only — stts/stco/stsc untouched.
+    avcC profile bumped to High10 + Level 6.2 to prevent re-encode.
+    No frozen end, no seek issues (all original timing preserved).
     """
-    data = _bump_avcC_level(data)
+    # First patch avcC fingerprint
+    data = _patch_avcC_fingerprint(data)
+
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return None
     
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
@@ -348,135 +358,51 @@ def inflate_sample_table_video(data, multiplier=5):
     stbl_off, stbl_sz, trak_off, mdia_off, minf_off = video_stbl
     stbl_end = stbl_off + stbl_sz
 
-    stts_off, stts_sz = _find_box(data, b"stts", stbl_off+8, stbl_end)
     stsz_off, stsz_sz = _find_box(data, b"stsz", stbl_off+8, stbl_end)
-    stco_off, stco_sz = _find_box(data, b"stco", stbl_off+8, stbl_end)
-    stsc_off, stsc_sz = _find_box(data, b"stsc", stbl_off+8, stbl_end)
-
-    if -1 in (stts_off, stsz_off, stco_off, stsc_off):
+    if stsz_off == -1:
         return None
 
-    stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
-    real_count = 0
-    last_delta = 0
-    stts_entries = []
-    for i in range(stts_entry_count):
-        off = stts_off + 16 + i * 8
-        cnt = int.from_bytes(data[off:off+4], 'big')
-        delta = int.from_bytes(data[off+4:off+8], 'big')
-        real_count += cnt
-        last_delta = delta
-        stts_entries.append((cnt, delta))
-    if real_count == 0:
-        return None
-
-    orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
-    total_count = real_count * multiplier
-    fake_count = total_count - real_count
-
-    # Single-entry stts: compress timeline so total matches original duration
-    # new_delta = real_total_duration / total_count
-    real_total_duration = sum(cnt * delta for cnt, delta in stts_entries)
-    new_delta = max(1, real_total_duration // total_count)
-    new_stts_body = struct.pack('>II', 0, 1)
-    new_stts_body += struct.pack('>II', total_count, new_delta)
-    new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
-
-    # Update stss sync sample indices (1-indexed)
-    stss_off, stss_sz = _find_box(data, b"stss", stbl_off+8, stbl_end)
-    new_stss = None
-    if stss_off != -1:
-        stss_count = int.from_bytes(data[stss_off+12:stss_off+16], 'big')
-        new_stss_body = bytearray(8 + stss_count * 4)
-        struct.pack_into('>II', new_stss_body, 0, 0, stss_count)
-        for i in range(stss_count):
-            old_idx = int.from_bytes(data[stss_off+16+i*4:stss_off+20+i*4], 'big')
-            new_idx = (old_idx - 1) * multiplier + 1
-            struct.pack_into('>I', new_stss_body, 8 + i*4, new_idx)
-        new_stss = struct.pack('>I4s', 8 + len(new_stss_body), b'stss') + bytes(new_stss_body)
-        stss_delta = len(new_stss) - stss_sz
-    else:
-        stss_delta = 0
-
-    new_stsz_body = bytearray(20 + total_count * 4)
-    struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
+    # Read stsz
     uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
-    real_sizes_off = stsz_off + 20
-    for i in range(real_count):
-        if uniform_size != 0:
-            val = uniform_size
-        else:
-            val = int.from_bytes(data[real_sizes_off+i*4:real_sizes_off+i*4+4], 'big')
-        struct.pack_into('>I', new_stsz_body, 12 + i*4, val)
-    for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, len(FILLER_NAL))
-    new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
+    orig_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
+    new_count = orig_count * multiplier
+    diff = new_count - orig_count
+    if diff <= 0:
+        return data
 
-    stts_delta = len(new_stts) - stts_sz
+    # Build new stsz
+    if uniform_size != 0:
+        body_size = 12 + new_count * 4
+        new_body = bytearray(body_size)
+        struct.pack_into('>III', new_body, 0, 0, 0, new_count)
+        for i in range(orig_count):
+            struct.pack_into('>I', new_body, 12 + i*4, uniform_size)
+    else:
+        body_size = 12 + new_count * 4
+        new_body = bytearray(body_size)
+        struct.pack_into('>III', new_body, 0, 0, 0, new_count)
+        src_start = stsz_off + 20
+        new_body[12:12+orig_count*4] = data[src_start:src_start+orig_count*4]
+
+    new_stsz = struct.pack('>I4s', 8 + body_size, b'stsz') + bytes(new_body)
     stsz_delta = len(new_stsz) - stsz_sz
-    stco_delta = fake_count * 4
-    stsc_delta = 12
-    moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta + stss_delta
+    if stsz_delta == 0:
+        return data
 
-    new_stco_count = orig_stco_count + fake_count
+    # Replace stsz only — stts/stco/stsc untouched
+    result = bytearray(len(data) + stsz_delta)
+    result[0:stsz_off] = data[:stsz_off]
+    result[stsz_off:stsz_off + len(new_stsz)] = new_stsz
+    result[stsz_off + len(new_stsz):] = data[stsz_off + stsz_sz:]
 
-    stsc_entry_count = int.from_bytes(data[stsc_off+12:stsc_off+16], 'big')
-    new_stsc_entry_count = stsc_entry_count + 1
-    new_stsc_body = bytearray(8 + new_stsc_entry_count * 12)
-    struct.pack_into('>II', new_stsc_body, 0, 0, new_stsc_entry_count)
-    base = stsc_off + 16
-    for i in range(stsc_entry_count):
-        for j in range(3):
-            val = int.from_bytes(data[base+i*12+j*4:base+i*12+j*4+4], 'big')
-            struct.pack_into('>I', new_stsc_body, 8 + i*12 + j*4, val)
-    extra_first_chunk = orig_stco_count + 1
-    struct.pack_into('>III', new_stsc_body, 8 + stsc_entry_count*12, extra_first_chunk, 1, 1)
-    new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
-
-    stco_base = stco_off + 16
-    safe_offset = len(data)
-    new_stco_body2 = bytearray(8 + new_stco_count * 4)
-    struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
-    for i in range(orig_stco_count):
-        val = int.from_bytes(data[stco_base+i*4:stco_base+i*4+4], 'big')
-        struct.pack_into('>I', new_stco_body2, 8 + i*4, val)
-    for i in range(fake_count):
-        struct.pack_into('>I', new_stco_body2, 8 + orig_stco_count*4 + i*4, safe_offset)
-    new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
-
-    replacements = [
-        (stts_off, stts_sz, new_stts),
-        (stsz_off, stsz_sz, new_stsz),
-        (stsc_off, stsc_sz, new_stsc),
-        (stco_off, stco_sz, new_stco2),
-    ]
-    if new_stss is not None:
-        replacements.append((stss_off, stss_sz, new_stss))
-    replacements.sort(key=lambda x: x[0])
-
-    filler_total = fake_count * len(FILLER_NAL)
-    new_size = len(data) + moov_delta + filler_total
-    result = bytearray(new_size)
-
-    read_pos = 0
-    write_pos = 0
-    for off, old_sz, new_bytes in replacements:
-        result[write_pos:write_pos + off - read_pos] = data[read_pos:off]
-        write_pos += off - read_pos
-        result[write_pos:write_pos + len(new_bytes)] = new_bytes
-        write_pos += len(new_bytes)
-        read_pos = off + old_sz
-    result[write_pos:write_pos + len(data) - read_pos] = data[read_pos:]
-    write_pos += len(data) - read_pos
-
+    # Update container sizes
     for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
         old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
-        struct.pack_into('>I', result, container_off, old_sz + moov_delta)
+        struct.pack_into('>I', result, container_off, old_sz + stsz_delta)
 
-    new_moov_end = moov_off + moov_sz + moov_delta
-    _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
-
-    result[write_pos:write_pos + filler_total] = FILLER_NAL * fake_count
+    # Adjust all stco entries for the moov delta
+    new_moov_sz = moov_sz + stsz_delta
+    _adjust_stco(result, stsz_delta, moov_off+8, moov_off+8+new_moov_sz)
 
     return bytes(result)
 
@@ -693,7 +619,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ── Pass 6: Frame Count Inflation (avcC bump + single-entry stts) ─────────
     if log_func:
         log_func("")
-        log_func("── 6/7  Frame Count Inflation (avcC 6.2, stts 300fps) ──────")
+        log_func("── 6/7  Frame Count Inflation (avcC High10+6.2, stsz-only) ────")
     inflated = inflate_sample_table_video(data, multiplier=5)
     if inflated is None:
         if log_func:
