@@ -388,6 +388,7 @@ def inflate_sample_table_video(data, multiplier=5):
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Read real frame sizes and chunk offsets
+    uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
     real_sizes = []
     for i in range(real_count):
         if uniform_size != 0:
