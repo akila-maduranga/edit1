@@ -332,8 +332,8 @@ def inflate_sample_table_video(data, multiplier=5):
     fake_count = total_count - real_count
 
     # Build stts: original entries + 1 extra for fake frames
-    # Use last_delta/4 ≈ 375 (240fps, ~16s frozen)
-    fake_delta = max(last_delta // 4, 300)
+    # Use last_delta*2/5 ≈ 600 (150fps, ~25s frozen, within H.264 Level 5.1)
+    fake_delta = max(last_delta * 2 // 5, 500)
     new_stts_body = struct.pack('>II', 0, stts_entry_count + 1)
     for cnt, delta in stts_entries:
         new_stts_body += struct.pack('>II', cnt, delta)
