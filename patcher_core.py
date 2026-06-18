@@ -753,7 +753,7 @@ def patch_stsd_bitrate(data, bitrate=100_000_000):
             continue
         if result[hdlr_off+16:hdlr_off+20] != b'vide':
             continue
-        minf_off, minf_sz = _find_box(result, b"minf", mdia_off+8, mdia_off+minf_sz)
+        minf_off, minf_sz = _find_box(result, b"minf", mdia_off+8, mdia_off+mdia_sz)
         if minf_off == -1:
             continue
         stbl_off, stbl_sz = _find_box(result, b"stbl", minf_off+8, minf_off+minf_sz)
