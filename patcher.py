@@ -16,10 +16,13 @@ if __name__ == "__main__":
     p.add_argument("-o", "--output", default="patched_output.mp4", help="Output path")
     p.add_argument("--comment", default=None,
                    help="\xa9cmt comment (default: auto-generated timestamped tag)")
+    p.add_argument("--no-inflate", action="store_true",
+                   help="Disable frame count inflation; use codec/brand spoofing instead")
     args = p.parse_args()
 
     def log(msg):
         print(msg)
 
-    ok = patch_all(args.input, args.output, comment=args.comment, log_func=log)
+    ok = patch_all(args.input, args.output, comment=args.comment, log_func=log,
+                   use_inflation=not args.no_inflate)
     sys.exit(0 if ok else 1)

@@ -673,9 +673,51 @@ def patch_audio_duration(data, original_duration):
     return data
 
 
+# ── Ftyp Brand Spoofing ─────────────────────────────────────────────────
+
+def patch_ftyp(data):
+    result = bytearray(data)
+    ftyp_off, ftyp_sz = _find_box(result, b"ftyp")
+    if ftyp_off == -1:
+        return data
+    result[ftyp_off+8:ftyp_off+12] = b'M4VH'
+    return bytes(result)
+
+
+# ── Stsd Codec Spoofing (avc1 -> avc3) ─────────────────────────────────
+
+def patch_stsd_codec(data):
+    result = bytearray(data)
+    moov_off, moov_sz = _find_box(result, b"moov")
+    if moov_off == -1:
+        return data
+    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz):
+        mdia_off, mdia_sz = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(result, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1:
+            continue
+        if result[hdlr_off+16:hdlr_off+20] != b'vide':
+            continue
+        minf_off, minf_sz = _find_box(result, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1:
+            continue
+        stbl_off, stbl_sz = _find_box(result, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1:
+            continue
+        stsd_off, stsd_sz = _find_box(result, b"stsd", stbl_off+8, stbl_off+stbl_sz)
+        if stsd_off == -1:
+            continue
+        entry_off = stsd_off + 16
+        if result[entry_off+4:entry_off+8] == b'avc1':
+            result[entry_off+4:entry_off+8] = b'avc3'
+    return bytes(result)
+
+
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
@@ -761,21 +803,31 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func("[TKHD] done")
 
-    # ── Pass 6: Frame Count Inflation (avcC bump + single-entry stts) ─────────
-    if log_func:
-        log_func("")
-        log_func("── 6/7  Frame Count Inflation (5x, non-interleaved, duration clip) ─────")
-    inflated = inflate_sample_table_video(data, multiplier=5)
-    if inflated is None:
+    if use_inflation:
+        # ── Pass 6a: Frame Count Inflation ────────────────────────────
         if log_func:
-            log_func("[ERROR] Frame inflation failed")
-        try: clean.unlink(missing_ok=True)
-        except: pass
-        return False
-    data = inflated
-    if log_func:
-        log_func("[INFLATE] done")
-
+            log_func("")
+            log_func("── 6/7  Frame Count Inflation (5x, non-interleaved, duration clip) ─────")
+        inflated = inflate_sample_table_video(data, multiplier=5)
+        if inflated is None:
+            if log_func:
+                log_func("[ERROR] Frame inflation failed")
+            try: clean.unlink(missing_ok=True)
+            except: pass
+            return False
+        data = inflated
+        if log_func:
+            log_func("[INFLATE] done")
+    else:
+        # ── Pass 6b: Codec + Brand Spoofing ───────────────────────────
+        if log_func:
+            log_func("")
+            log_func("── 6/7  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
+        data = patch_stsd_codec(data)
+        data = patch_ftyp(data)
+        if log_func:
+            log_func("[CODEC] done")
+    
     # ── Pass 7: Comment Udta Injection ───────────────────────────────────
     if log_func:
         log_func("")
