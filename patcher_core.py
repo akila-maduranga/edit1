@@ -495,9 +495,16 @@ def inflate_sample_table_video(data, multiplier=5, original_size=None):
         old = int.from_bytes(result[c_off:c_off+4], 'big')
         struct.pack_into('>I', result, c_off, old + moov_delta)
 
-    # Update all trak stco/co64 with moov_delta (audio track, etc.)
+    # Extend mdat to include dummy padding (keep file valid)
+    mdat_off, mdat_sz = _find_box(result, b"mdat")
+    if mdat_off != -1:
+        struct.pack_into('>I', result, mdat_off, mdat_sz + padding_sz)
+
+    # Update all NON-video trak stco/co64 with moov_delta
     new_moov_end = moov_off + int.from_bytes(result[moov_off:moov_off+4], 'big')
     for t_off, t_sz, _ in _iter_boxes(result, moov_off+8, new_moov_end):
+        if t_off == trak_off:
+            continue  # video track already has moov_delta in its new stco
         t_mdia_off, _ = _find_box(result, b"mdia", t_off+8, t_off+t_sz)
         if t_mdia_off == -1:
             continue
