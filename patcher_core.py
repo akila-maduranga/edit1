@@ -345,11 +345,11 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=10):
-    """10x inflation: NoBlur-style with same delta for all frames.
-    Real and fake frames use same delta (consistent timing).
+def inflate_sample_table_video(data, multiplier=5):
+    """5x inflation: Hybrid approach with NoBlur-style small dummy size.
+    Real frames with original delta, fake frames with small delta.
     Small dummy size (8 bytes) at single safeOffset.
-    No duration clipping - preserves original structure.
+    Padding at EOF for dummy data.
     """
     data = _patch_avcC_sps(data)
 
@@ -409,11 +409,12 @@ def inflate_sample_table_video(data, multiplier=10):
     fake_count = total_count - real_count
     fake_delta = 750
 
-    # Single-entry stts: same delta for real and fake frames (NoBlur-style)
-    # This keeps timing consistent - both real and fake use average delta
-    avg_delta = total_ticks // real_count if real_count > 0 else last_delta
-    new_stts_body = struct.pack('>II', 0, 1)
-    new_stts_body += struct.pack('>II', total_count, avg_delta)
+    # Two-entry stts: real frames with original delta, fake frames with small delta
+    # Using same delta for all frames changes total duration - causes playback issues
+    fake_delta = 1  # Small delta for fake frames
+    new_stts_body = struct.pack('>II', 0, 2)
+    new_stts_body += struct.pack('>II', real_count, last_delta)
+    new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Find mdat for offset calculation (no filler NALs added)
@@ -447,7 +448,7 @@ def inflate_sample_table_video(data, multiplier=10):
         struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, DUMMY_SIZE)
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
-    # stsc: all chunks have 1 sample
+    # stsc: all chunks have 1 sample (simpler approach)
     new_stsc_body = struct.pack('>II', 0, 1)
     new_stsc_body += struct.pack('>III', 1, 1, 1)
     new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
@@ -460,11 +461,19 @@ def inflate_sample_table_video(data, multiplier=10):
     moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
 
     # stco: real frames with original offsets, fake frames at single safeOffset (NoBlur-style)
-    safe_offset = len(data) + moov_delta  # Offset after moov expansion
+    # Check if moov comes before mdat
+    mdat_off, mdat_sz = _find_box(data, b"mdat")
+    moov_before_mdat = moov_off < mdat_off if mdat_off != -1 else False
+    
+    # Calculate safeOffset - points to start of padding after original data
+    safe_offset = len(data) + moov_delta
+    
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     for i in range(real_count):
-        struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i] + moov_delta)
+        # Only add moov_delta if moov comes before mdat
+        offset_adjust = moov_delta if moov_before_mdat else 0
+        struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i] + offset_adjust)
     for i in range(fake_count):
         struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, safe_offset)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
@@ -721,7 +730,7 @@ def patch_stsd_codec(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
