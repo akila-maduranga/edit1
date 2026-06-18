@@ -345,8 +345,8 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=1.2):
-    """1.2x inflation: non-interleaved, two-entry stts, no filler NALs.
+def inflate_sample_table_video(data, multiplier=3):
+    """3x inflation: non-interleaved, two-entry stts, no filler NALs.
     Real frames at original delta, filler at small delta.
     Container durations clipped to real duration.
     Unique stco entries — no compression.
