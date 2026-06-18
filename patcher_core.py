@@ -808,8 +808,8 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     if log_func:
         log_func("[TKHD] done")
 
+    # ── Pass 6a: Frame Count Inflation ────────────────────────────
     if use_inflation:
-        # ── Pass 6a: Frame Count Inflation ────────────────────────────
         if log_func:
             log_func("")
             log_func("── 6/7  Frame Count Inflation (5x, non-interleaved, duration clip) ─────")
@@ -823,20 +823,25 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         data = inflated
         if log_func:
             log_func("[INFLATE] done")
+    
+    # ── Pass 6b: Brand / Codec Spoofing (always runs) ────────────
+    if log_func:
+        log_func("")
+    has_inflation = use_inflation
+    do_avc3 = not brand_spoof_only
+    if has_inflation and do_avc3:
+        label = "6b/7  Codec + Brand (avc1→avc3, M4VH)"
+    elif do_avc3:
+        label = "6b/7  Codec + Brand (avc1→avc3, M4VH)"
     else:
-        # ── Pass 6b: Brand Spoofing (with optional avc3) ────────────
-        if log_func:
-            log_func("")
-            log_func("── 6/7  Brand Spoofing ─────────────────────────────────────")
-        if brand_spoof_only:
-            data = patch_ftyp(data)
-            if log_func:
-                log_func("[BRAND] M4VH only")
-        else:
-            data = patch_stsd_codec(data)
-            data = patch_ftyp(data)
-            if log_func:
-                log_func("[CODEC] avc1→avc3 + M4VH")
+        label = "6b/7  Brand Only (M4VH)"
+    if log_func:
+        log_func(f"── {label} ───────────────────────────────")
+    if do_avc3:
+        data = patch_stsd_codec(data)
+    data = patch_ftyp(data)
+    if log_func:
+        log_func(f"[PASS6b] {'avc3 + ' if do_avc3 else ''}M4VH done")
     
     # ── Pass 7: Comment Udta Injection ───────────────────────────────────
     if log_func:
