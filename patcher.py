@@ -197,6 +197,7 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
     hdlr = struct.pack('>I4sI', 41, b'hdlr', 0)
     hdlr += struct.pack('>I4s', 0, b'mdir')
     hdlr += b'appl' + struct.pack('>II', 0, 0)  # vendor=Apple
+    hdlr += b'Metadata\x00'  # component name
     meta_content = b'\x00\x00\x00\x00' + hdlr + ilst
     meta = struct.pack('>I4s', 8 + len(meta_content), b'meta') + meta_content
     return struct.pack('>I4s', 8 + len(meta), b'udta') + meta

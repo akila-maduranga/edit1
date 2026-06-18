@@ -186,6 +186,7 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
     hdlr = struct.pack('>I4sI', 41, b'hdlr', 0)
     hdlr += struct.pack('>I4s', 0, b'mdir')
     hdlr += b'appl' + struct.pack('>II', 0, 0)  # vendor=Apple
+    hdlr += b'Metadata\x00'  # component name
     meta_content = b'\x00\x00\x00\x00' + hdlr + ilst
     meta = struct.pack('>I4s', 8 + len(meta_content), b'meta') + meta_content
     udta_data += meta
@@ -542,7 +543,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func("")
         log_func("── 6/8  Inject metadata (ilst box) ─────────────────────────────")
-    moov_idx = data.rfind(b'moov')
+    moov_idx = data.find(b'moov')
     moov_start = moov_idx - 4
     current_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
     moov_end = moov_start + current_size
