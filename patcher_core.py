@@ -341,11 +341,12 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=5):
+def inflate_sample_table_video(data, multiplier=5, original_size=None):
     """5x inflation: non-interleaved, two-entry stts + filler NALs at end.
     Real frames at original delta, filler at delta=750.
     Container durations clipped to real duration.
     Unique stco entries — no compression.
+    Auto-pads file to match expected size for inflated bitrate.
     """
     data = _patch_avcC_sps(data)
 
@@ -411,7 +412,7 @@ def inflate_sample_table_video(data, multiplier=5):
     new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-    # Find mdat for filler data
+    # Find mdat for filler NAL data
     mdat_off, mdat_sz = _find_box(data, b"mdat")
     if mdat_off == -1:
         return None
@@ -432,17 +433,11 @@ def inflate_sample_table_video(data, multiplier=5):
     if not real_offsets:
         return None
 
-    # Find smallest real frame data (use as filler — decoder produces valid picture)
-    min_size_idx = min(range(real_count), key=lambda i: real_sizes[i])
-    min_size = real_sizes[min_size_idx]
-    mdat_data = data[mdat_off+8:mdat_off+mdat_sz]  # skip mdat header
-    # Read the smallest frame's bytes from mdat
-    min_frame_off = real_offsets[min_size_idx] - (mdat_off + 8)
-    if min_frame_off + min_size > len(mdat_data):
-        min_frame_off = 0
-        min_size = min(real_sizes)
-    filler_frame_data = mdat_data[min_frame_off:min_frame_off+min_size]
-    filler_data = filler_frame_data * fake_count
+    # Use filler NALs (no encode freeze, but needed for 5x count to prevent compression)
+    FILLER_NAL = b'\x00\x00\x00\x01\x0c\x80'
+    FILLER_NAL_SIZE = 512
+    filler_frame = FILLER_NAL + b'\x00' * (FILLER_NAL_SIZE - len(FILLER_NAL))
+    filler_data = filler_frame * fake_count
 
     # Non-interleaved stsz: all real, then all filler
     new_stsz_body = bytearray(20 + total_count * 4)
@@ -450,7 +445,7 @@ def inflate_sample_table_video(data, multiplier=5):
     for i in range(real_count):
         struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
     for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, min_size)
+        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, FILLER_NAL_SIZE)
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
     # stsc: all chunks have 1 sample
@@ -471,7 +466,7 @@ def inflate_sample_table_video(data, multiplier=5):
     for i in range(real_count):
         struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
     for i in range(fake_count):
-        pos = mdat_off + mdat_sz + i * min_size
+        pos = mdat_off + mdat_sz + i * FILLER_NAL_SIZE
         struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
@@ -552,6 +547,15 @@ def inflate_sample_table_video(data, multiplier=5):
                 mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
                 mdhd_dur = int(real_sec * mdhd_ts)
                 result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
+
+    # Auto-pad to match expected size for inflated bitrate
+    if original_size is not None:
+        target_size = original_size * multiplier
+        need = max(0, target_size - len(result))
+        if need > 0:
+            free_sz = 8 + need
+            free_box = struct.pack('>I4s', free_sz, b'free') + b'\x00' * need
+            result.extend(free_box)
 
     return bytes(result)
 
@@ -884,7 +888,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         if log_func:
             log_func("")
             log_func("── 6/7  Frame Count Inflation (5x, non-interleaved, duration clip) ─────")
-        inflated = inflate_sample_table_video(data, multiplier=5)
+        inflated = inflate_sample_table_video(data, multiplier=5, original_size=len(original_data))
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
