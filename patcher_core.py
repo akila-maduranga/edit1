@@ -345,8 +345,8 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=2):
-    """2x inflation: non-interleaved, two-entry stts + filler NALs at end.
+def inflate_sample_table_video(data, multiplier=1.2):
+    """1.2x inflation: non-interleaved, two-entry stts, no filler NALs.
     Real frames at original delta, filler at small delta.
     Container durations clipped to real duration.
     Unique stco entries — no compression.
@@ -417,14 +417,10 @@ def inflate_sample_table_video(data, multiplier=2):
     new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-    # Find mdat for filler NAL data
+    # Find mdat for offset calculation (no filler NALs added)
     mdat_off, mdat_sz = _find_box(data, b"mdat")
     if mdat_off == -1:
         return None
-    FILLER_NAL = b'\x00\x00\x00\x01\x0c\x80'  # valid H.264 filler NAL
-    FILLER_NAL_SIZE = 512  # pad to 512 bytes to mimic realistic frame size
-    filler_frame = FILLER_NAL + b'\x00' * (FILLER_NAL_SIZE - len(FILLER_NAL))
-    filler_data = filler_frame * fake_count
 
     # Read real frame sizes
     orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
@@ -442,13 +438,14 @@ def inflate_sample_table_video(data, multiplier=2):
     if not real_offsets:
         return None
 
-    # Non-interleaved stsz: all real, then all filler
+    # stsz: cycle through real frame sizes for fake frames (no filler NALs)
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     for i in range(real_count):
         struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
     for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, FILLER_NAL_SIZE)
+        # Cycle through real frame sizes
+        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, real_sizes[i % real_count])
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
     # stsc: all chunks have 1 sample
@@ -463,14 +460,14 @@ def inflate_sample_table_video(data, multiplier=2):
     stsc_delta = len(new_stsc) - stsc_sz
     moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
 
-    # Non-interleaved stco: all real offsets, then all filler offsets
+    # stco: cycle through real frame offsets for fake frames (no filler NALs)
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     for i in range(real_count):
         struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
     for i in range(fake_count):
-        pos = mdat_off + mdat_sz + i * FILLER_NAL_SIZE
-        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
+        # Cycle through real frame offsets
+        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, real_offsets[i % real_count])
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     replacements = [
@@ -501,10 +498,6 @@ def inflate_sample_table_video(data, multiplier=2):
 
     new_moov_end = moov_off + moov_sz + moov_delta
     _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
-
-    # Extend mdat with filler NALs and update mdat header
-    result.extend(filler_data)
-    struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + len(filler_data))
 
     # Clip container durations to real video duration
     real_sec = total_ticks / 90000.0
@@ -719,7 +712,7 @@ def patch_stsd_codec(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
