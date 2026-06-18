@@ -345,9 +345,9 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation: non-interleaved, two-entry stts + filler NALs at end.
-    Real frames at original delta, filler at delta=750.
+def inflate_sample_table_video(data, multiplier=2):
+    """2x inflation: non-interleaved, two-entry stts + filler NALs at end.
+    Real frames at original delta, filler at small delta.
     Container durations clipped to real duration.
     Unique stco entries — no compression.
     """
@@ -409,9 +409,9 @@ def inflate_sample_table_video(data, multiplier=5):
     fake_count = total_count - real_count
     fake_delta = 750
 
-    # Two-entry stts: real frames with original delta, fake frames with delta=0
-    # This keeps timing consistent with sample count (stsz/stco have 5x entries)
-    fake_delta = 0  # Fake frames contribute no duration
+    # Two-entry stts: real frames with original delta, fake frames with small delta
+    # This keeps timing consistent with sample count (stsz/stco have 2x entries)
+    fake_delta = 1  # Small non-zero duration to prevent transcoder hang
     new_stts_body = struct.pack('>II', 0, 2)
     new_stts_body += struct.pack('>II', real_count, last_delta)
     new_stts_body += struct.pack('>II', fake_count, fake_delta)
@@ -719,7 +719,7 @@ def patch_stsd_codec(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
