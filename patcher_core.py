@@ -356,7 +356,8 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             result.append(sample_off)
             sample_idx += 1
     return result
-    return result
+
+def inflate_sample_table_video(data, multiplier=5):
     """5x inflation: single-entry stts + interleaved real/filler NALs + avcC/SPS patch.
     Single entry delta=750 (120fps) — proven to pass processing.
     Real frames and filler NALs interleaved to avoid contiguous freeze.
