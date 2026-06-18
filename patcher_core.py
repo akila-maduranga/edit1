@@ -318,7 +318,45 @@ def _patch_avcC_sps(data):
     return data
 
 
-def inflate_sample_table_video(data, multiplier=5):
+def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
+    """Expand chunk offsets to per-sample offsets using stsc + stsz."""
+    stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
+    offsets = []
+    for i in range(stco_count):
+        offsets.append(int.from_bytes(data[stco_off+16+i*4:stco_off+20+i*4], 'big'))
+
+    uniform = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
+    sz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
+    szs = []
+    for i in range(min(sz_count, sample_count)):
+        if uniform != 0:
+            szs.append(uniform)
+        else:
+            szs.append(int.from_bytes(data[stsz_off+20+i*4:stsz_off+24+i*4], 'big'))
+
+    stsc_count = int.from_bytes(data[stsc_off+12:stsc_off+16], 'big')
+    chunks_spc = []
+    for i in range(stsc_count):
+        first = int.from_bytes(data[stsc_off+16+i*12:stsc_off+20+i*12], 'big')
+        spc = int.from_bytes(data[stsc_off+20+i*12:stsc_off+24+i*12], 'big')
+        next_first = int.from_bytes(data[stsc_off+28+i*12:stsc_off+32+i*12], 'big') if i + 1 < stsc_count else sample_count + 1
+        for _ in range(first - 1, next_first - 1):
+            chunks_spc.append(spc)
+
+    result = []
+    sample_idx = 0
+    for chunk_idx, spc in enumerate(chunks_spc):
+        if chunk_idx >= len(offsets):
+            break
+        chunk_off = offsets[chunk_idx]
+        for s in range(spc):
+            if sample_idx >= sample_count:
+                return result
+            sample_off = chunk_off + sum(szs[sample_idx - s:sample_idx])
+            result.append(sample_off)
+            sample_idx += 1
+    return result
+    return result
     """5x inflation: single-entry stts + interleaved real/filler NALs + avcC/SPS patch.
     Single entry delta=750 (120fps) — proven to pass processing.
     Real frames and filler NALs interleaved to avoid contiguous freeze.
@@ -408,9 +446,10 @@ def inflate_sample_table_video(data, multiplier=5):
         else:
             real_sizes.append(uniform_size if uniform_size else 0)
 
-    stco_vals = []
-    for i in range(orig_stco_count):
-        stco_vals.append(int.from_bytes(data[stco_off+16+i*4:stco_off+20+i*4], 'big'))
+    # Expand per-sample chunk offsets using stsc data
+    real_offsets = _sample_offsets(data, stco_off, stsc_off, stsz_off, real_count)
+    if not real_offsets:
+        return None
 
     # Build interleaved stsz: real, filler×4, real, filler×4, ...
     new_stsz_body = bytearray(20 + total_count * 4)
@@ -447,7 +486,7 @@ def inflate_sample_table_video(data, multiplier=5):
     fake_idx = 0
     for i in range(real_count):
         base = 8 + i * (fake_per_real + 1) * 4
-        struct.pack_into('>I', new_stco_body2, base, stco_vals[i])
+        struct.pack_into('>I', new_stco_body2, base, real_offsets[i])
         for j in range(fake_per_real):
             pos = mdat_off + mdat_sz + fake_idx * FILLER_NAL_SIZE
             struct.pack_into('>I', new_stco_body2, base + (1 + j) * 4, pos)
