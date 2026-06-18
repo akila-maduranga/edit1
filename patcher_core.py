@@ -357,10 +357,12 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=4):
-    """4x inflation: two-entry stts + filler NALs at end (non-interleaved).
+def inflate_sample_table_video(data, multiplier=5):
+    """5x inflation: two-entry stts + filler NALs at end (non-interleaved).
     Real frames at original delta (60fps), then filler NALs at delta=750.
-    Unique stco entries — no compression. Shorter freeze than 5x.
+    Container durations (mvhd/tkhd/mdhd) clipped to real video duration
+    to prevent TikTok's player from showing the freeze region.
+    Unique stco entries — no compression.
     """
     data = _patch_avcC_sps(data)
 
@@ -404,12 +406,14 @@ def inflate_sample_table_video(data, multiplier=4):
     stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
     real_count = 0
     last_delta = 0
+    total_ticks = 0
     for i in range(stts_entry_count):
         off = stts_off + 16 + i * 8
         cnt = int.from_bytes(data[off:off+4], 'big')
         delta = int.from_bytes(data[off+4:off+8], 'big')
         real_count += cnt
         last_delta = delta
+        total_ticks += cnt * delta
     if real_count == 0:
         return None
 
@@ -511,6 +515,52 @@ def inflate_sample_table_video(data, multiplier=4):
     # Extend mdat with filler NALs and update mdat header
     result.extend(filler_data)
     struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + len(filler_data))
+
+    # Clip container durations to real video duration (prevent freeze display)
+    real_sec = total_ticks / 90000.0
+    mvhd_dur = int(real_sec * 1000)  # fallback
+    mvhd_off = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
+    if mvhd_off != -1:
+        ver = result[mvhd_off+12]
+        if ver == 0:
+            mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
+            mvhd_dur = int(real_sec * mvhd_ts)
+            result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
+        else:
+            mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
+            mvhd_dur = int(real_sec * mvhd_ts)
+            result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
+
+    # Clip tkhd and mdhd for each trak
+    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
+        tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
+        if tkhd_off != -1:
+            ver = result[tkhd_off+12]
+            if ver == 0:
+                result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', mvhd_dur)
+            else:
+                result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', mvhd_dur)
+
+        mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(result, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1:
+            continue
+        mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+        if mdhd_off == -1:
+            continue
+        is_video = result[hdlr_off+16:hdlr_off+20] == b'vide'
+        ver = result[mdhd_off+12]
+        if is_video:
+            if ver == 0:
+                mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
+                mdhd_dur = int(real_sec * mdhd_ts)
+                result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
+            else:
+                mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
+                mdhd_dur = int(real_sec * mdhd_ts)
+                result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
 
     return bytes(result)
 
@@ -727,8 +777,8 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ── Pass 6: Frame Count Inflation (avcC bump + single-entry stts) ─────────
     if log_func:
         log_func("")
-        log_func("── 6/7  Frame Count Inflation (single-entry stts delta=750, interleaved) ─────")
-    inflated = inflate_sample_table_video(data, multiplier=4)
+        log_func("── 6/7  Frame Count Inflation (5x, non-interleaved, duration clip) ─────")
+    inflated = inflate_sample_table_video(data, multiplier=5)
     if inflated is None:
         if log_func:
             log_func("[ERROR] Frame inflation failed")
