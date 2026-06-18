@@ -717,7 +717,7 @@ def patch_stsd_codec(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True, brand_spoof_only=False):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
@@ -824,14 +824,19 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         if log_func:
             log_func("[INFLATE] done")
     else:
-        # ── Pass 6b: Codec + Brand Spoofing ───────────────────────────
+        # ── Pass 6b: Brand Spoofing (with optional avc3) ────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
-        data = patch_stsd_codec(data)
-        data = patch_ftyp(data)
-        if log_func:
-            log_func("[CODEC] done")
+            log_func("── 6/7  Brand Spoofing ─────────────────────────────────────")
+        if brand_spoof_only:
+            data = patch_ftyp(data)
+            if log_func:
+                log_func("[BRAND] M4VH only")
+        else:
+            data = patch_stsd_codec(data)
+            data = patch_ftyp(data)
+            if log_func:
+                log_func("[CODEC] avc1→avc3 + M4VH")
     
     # ── Pass 7: Comment Udta Injection ───────────────────────────────────
     if log_func:

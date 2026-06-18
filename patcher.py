@@ -18,11 +18,14 @@ if __name__ == "__main__":
                    help="\xa9cmt comment (default: auto-generated timestamped tag)")
     p.add_argument("--no-inflate", action="store_true",
                    help="Disable frame count inflation; use codec/brand spoofing instead")
+    p.add_argument("--brand-only", action="store_true",
+                   help="Skip avc1→avc3, only spoof ftyp brand to M4VH")
     args = p.parse_args()
 
     def log(msg):
         print(msg)
 
     ok = patch_all(args.input, args.output, comment=args.comment, log_func=log,
-                   use_inflation=not args.no_inflate)
+                   use_inflation=not args.no_inflate,
+                   brand_spoof_only=args.brand_only)
     sys.exit(0 if ok else 1)

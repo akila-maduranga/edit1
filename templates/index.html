@@ -287,23 +287,20 @@
     <div id="file-name"></div>
   </div>
 
-  <!-- Pipeline steps -->
-  <div class="pipeline">
-    <div class="step">
-      <div class="step-num">01</div>
-      <div class="step-title">Stream Remux</div>
-      <div class="step-desc">ffmpeg stream copy, no re-encoding. moov atom moved to front (+faststart).</div>
-    </div>
-    <div class="step">
-      <div class="step-num">02</div>
-      <div class="step-title">ftyp Patch</div>
-      <div class="step-desc">Rewrites major brand to <code>mp42</code> with canonical compatible brands list.</div>
-    </div>
-    <div class="step">
-      <div class="step-num">03</div>
-      <div class="step-title">mvhd Flag Clear</div>
-      <div class="step-desc">Clears the random-access flag bit in the movie header box.</div>
-    </div>
+  <!-- Mode selector -->
+  <div style="display:flex;gap:10px;flex-wrap:wrap">
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+      <input type="radio" name="mode" value="inflation" checked>
+      <span>Inflation (5x frames)</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+      <input type="radio" name="mode" value="no-inflate">
+      <span>No-inflate (avc3 + M4VH)</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+      <input type="radio" name="mode" value="brand-only">
+      <span>Brand-only (M4VH only)</span>
+    </label>
   </div>
 
   <!-- Run -->
@@ -401,6 +398,7 @@
     // Upload
     const fd = new FormData();
     fd.append('file', selectedFile);
+    fd.append('mode', document.querySelector('input[name="mode"]:checked')?.value || 'inflation');
     appendLog(`[JOB] uploading ${selectedFile.name}…`);
 
     let jobId;
