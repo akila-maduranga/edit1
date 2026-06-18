@@ -200,13 +200,12 @@ def patch_mvhd_fingerprint(data):
         ct_off = mvhd_off + 20
         dur_off = mvhd_off + 32
         nti_off = mvhd_off + 96
-    # Set creation/modification time to a fixed point (Jan 1 2020)
-    fixed_ts = 1577836800
+    rand_ts = random.randint(1_600_000_000, 1_750_000_000)
     if ct_off + 8 <= len(p):
-        struct.pack_into('>II', p, ct_off, fixed_ts, fixed_ts)
-    # Set next_track_id to a large value to signal "already processed"
+        struct.pack_into('>II', p, ct_off, rand_ts, rand_ts)
+    rand_nti = random.randint(100, 9998)
     if nti_off + 4 <= len(p):
-        struct.pack_into('>I', p, nti_off, 9999)
+        struct.pack_into('>I', p, nti_off, rand_nti)
     return bytes(p)
 
 
@@ -251,7 +250,6 @@ def fingerprint_tkhd(data):
             group_off = tkhd_off + 8 + 44
         else:
             continue
-        # Set matrix to identity (standard)
         if matrix_off + 36 <= len(p):
             struct.pack_into('>I', p, matrix_off, 0x00010000)
             struct.pack_into('>I', p, matrix_off+4, 0)
@@ -262,23 +260,26 @@ def fingerprint_tkhd(data):
             struct.pack_into('>I', p, matrix_off+24, 0)
             struct.pack_into('>I', p, matrix_off+28, 0)
             struct.pack_into('>I', p, matrix_off+32, 0x40000000)
-        # Set alternate_group to a non-zero value (track-level fingerprint)
         if group_off + 2 <= len(p):
             struct.pack_into('>H', p, group_off, group_id)
             group_id += 1
     return bytes(p)
 
 
-# ── Frame Density Inflation (5x, valid filler NALs, normal timing) ─────
+# ── Frame Density Inflation (5x, single stts entry, duration-preserving) ─
 
 FILLER_NAL = b'\x00\x00\x00\x01\x0c\x00\x00\x80'
 
 def inflate_sample_table_video(data, multiplier=5):
+    """Inflate sample count 5x in stsz+stts+stco+stsc.
+    
+    Single-entry stts: new_delta = real_total_duration // total_count
+    so total playback duration matches the original — no frozen end.
+    """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
 
-    # Find video stbl
     video_stbl = None
     for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
         mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
@@ -312,7 +313,6 @@ def inflate_sample_table_video(data, multiplier=5):
     if -1 in (stts_off, stsz_off, stco_off, stsc_off):
         return None
 
-    # Read original sample count from stts
     stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
     real_count = 0
     last_delta = 0
@@ -331,16 +331,14 @@ def inflate_sample_table_video(data, multiplier=5):
     total_count = real_count * multiplier
     fake_count = total_count - real_count
 
-    # Build stts: original entries + 1 extra for fake frames
-    # Use last_delta*2/5 ≈ 600 (150fps, ~25s frozen, within H.264 Level 5.1)
-    fake_delta = max(last_delta * 2 // 5, 500)
-    new_stts_body = struct.pack('>II', 0, stts_entry_count + 1)
-    for cnt, delta in stts_entries:
-        new_stts_body += struct.pack('>II', cnt, delta)
-    new_stts_body += struct.pack('>II', fake_count, fake_delta)
+    # Single-entry stts: preserve original duration by computing
+    # new_delta = real_total_duration / total_count.
+    real_total_duration = sum(cnt * delta for cnt, delta in stts_entries)
+    new_delta = max(1, real_total_duration // total_count)
+    new_stts_body = struct.pack('>II', 0, 1)
+    new_stts_body += struct.pack('>II', total_count, new_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-    # Build stsz: all entries (real sizes + FILLER_NAL size for fake)
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
@@ -355,7 +353,6 @@ def inflate_sample_table_video(data, multiplier=5):
         struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, len(FILLER_NAL))
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
-    # Compute deltas
     stts_delta = len(new_stts) - stts_sz
     stsz_delta = len(new_stsz) - stsz_sz
     stco_delta = fake_count * 4
@@ -364,7 +361,6 @@ def inflate_sample_table_video(data, multiplier=5):
 
     new_stco_count = orig_stco_count + fake_count
 
-    # Build stsc: original entries + 1 extra for fake chunks
     stsc_entry_count = int.from_bytes(data[stsc_off+12:stsc_off+16], 'big')
     new_stsc_entry_count = stsc_entry_count + 1
     new_stsc_body = bytearray(8 + new_stsc_entry_count * 12)
@@ -378,9 +374,8 @@ def inflate_sample_table_video(data, multiplier=5):
     struct.pack_into('>III', new_stsc_body, 8 + stsc_entry_count*12, extra_first_chunk, 1, 1)
     new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
 
-    # Rebuild stco
     stco_base = stco_off + 16
-    safe_offset = len(data)  # _adjust_stco adds moov_delta later
+    safe_offset = len(data)
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     for i in range(orig_stco_count):
@@ -390,7 +385,6 @@ def inflate_sample_table_video(data, multiplier=5):
         struct.pack_into('>I', new_stco_body2, 8 + orig_stco_count*4 + i*4, safe_offset)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
-    # Replace atoms
     replacements = [
         (stts_off, stts_sz, new_stts),
         (stsz_off, stsz_sz, new_stsz),
@@ -414,16 +408,13 @@ def inflate_sample_table_video(data, multiplier=5):
     result[write_pos:write_pos + len(data) - read_pos] = data[read_pos:]
     write_pos += len(data) - read_pos
 
-    # Update container sizes
     for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
         old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
         struct.pack_into('>I', result, container_off, old_sz + moov_delta)
 
-    # Adjust all stco entries for the moov delta
     new_moov_end = moov_off + moov_sz + moov_delta
     _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-    # Write valid H.264 filler NALs at EOF
     result[write_pos:write_pos + filler_total] = FILLER_NAL * fake_count
 
     return bytes(result)
@@ -447,11 +438,11 @@ def build_comment_udta(comment):
     struct.pack_into('>I4sI', buf, p, meta_size, b'meta', 0); p += 12
 
     struct.pack_into('>I4sI', buf, p, hdlr_size, b'hdlr', 0); p += 12
-    struct.pack_into('>I', buf, p, 0); p += 4      # pre_defined
-    struct.pack_into('>4s', buf, p, b'mdir'); p += 4  # handler_type
-    struct.pack_into('>4s', buf, p, b'appl'); p += 4  # vendor
-    struct.pack_into('>II', buf, p, 0, 0); p += 8    # reserved
-    buf[p] = 0; p += 1                               # name (empty)
+    struct.pack_into('>I', buf, p, 0); p += 4
+    struct.pack_into('>4s', buf, p, b'mdir'); p += 4
+    struct.pack_into('>4s', buf, p, b'appl'); p += 4
+    struct.pack_into('>II', buf, p, 0, 0); p += 8
+    buf[p] = 0; p += 1
 
     struct.pack_into('>I4s', buf, p, ilst_size, b'ilst'); p += 8
 
