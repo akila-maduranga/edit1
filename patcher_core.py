@@ -8,7 +8,7 @@ Pipeline:
    3. mvhd Fingerprint (next_track_id = 9999, fixed creation date)
    4. Udta Strip (remove ffmpeg encoder signature)
    5. Tkhd Fingerprint (identity matrix + alternate_group)
-   6. Frame Count Inflation (5x, stsz-only, zero playback footprint)
+   6. Frame Count Inflation (5x, avcC bump, single-entry stts, stss update)
    7. Comment Udta Injection (Apple iTunes-style only)
    8. Restore original audio duration
 """
@@ -275,18 +275,14 @@ def _bump_avcC_level(data):
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
-    moov_end = moov_off + moov_sz
-    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_end):
-        _, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_sz == -1:
-            continue
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+        mdia_off, _ = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
         if mdia_off == -1:
             continue
         hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
         if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
             continue
-        minf_off, minf_sz = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        minf_off, _ = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
         if minf_off == -1:
             continue
         stbl_off, stbl_sz = _find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
@@ -304,9 +300,10 @@ def _bump_avcC_level(data):
             e_sz = int.from_bytes(data[pos:pos+4], 'big')
             e_type = data[pos+4:pos+8]
             if e_type == b'avc1':
-                avcC_off = data.find(b'avcC', pos+8, pos+e_sz)
+                avcC_off, _ = _find_box(data, b'avcC', pos+8, pos+e_sz)
                 if avcC_off != -1:
                     p = bytearray(data)
+                    old_level = p[avcC_off+11]
                     p[avcC_off+11] = 62  # 5.1 → 6.2
                     return bytes(p)
             pos += e_sz
@@ -316,10 +313,10 @@ def _bump_avcC_level(data):
 def inflate_sample_table_video(data, multiplier=5):
     """Inflate sample count 5x in stsz+stts+stco+stsc.
     
-    Bumps avcC level to 6.2 so TikTok's framerate check passes for our
-    compressed stts delta.  Single-entry stts preserves original duration.
+    Two-entry stts — original delta for real frames, safe delta for fakes.
+    Bumps avcC level to 6.2 so TikTok allows the higher fake fps.
+    Stss stays correct because real frame indices are unchanged.
     """
-    # First bump avcC level
     data = _bump_avcC_level(data)
     
     moov_off, moov_sz = _find_box(data, b"moov")
@@ -377,13 +374,29 @@ def inflate_sample_table_video(data, multiplier=5):
     total_count = real_count * multiplier
     fake_count = total_count - real_count
 
-    # Single-entry stts: preserve original duration by computing
-    # new_delta = real_total_duration / total_count.
+    # Single-entry stts: compress timeline so total matches original duration
+    # new_delta = real_total_duration / total_count
     real_total_duration = sum(cnt * delta for cnt, delta in stts_entries)
     new_delta = max(1, real_total_duration // total_count)
     new_stts_body = struct.pack('>II', 0, 1)
     new_stts_body += struct.pack('>II', total_count, new_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
+
+    # Update stss sync sample indices (1-indexed)
+    stss_off, stss_sz = _find_box(data, b"stss", stbl_off+8, stbl_end)
+    new_stss = None
+    if stss_off != -1:
+        stss_count = int.from_bytes(data[stss_off+12:stss_off+16], 'big')
+        new_stss_body = bytearray(8 + stss_count * 4)
+        struct.pack_into('>II', new_stss_body, 0, 0, stss_count)
+        for i in range(stss_count):
+            old_idx = int.from_bytes(data[stss_off+16+i*4:stss_off+20+i*4], 'big')
+            new_idx = (old_idx - 1) * multiplier + 1
+            struct.pack_into('>I', new_stss_body, 8 + i*4, new_idx)
+        new_stss = struct.pack('>I4s', 8 + len(new_stss_body), b'stss') + bytes(new_stss_body)
+        stss_delta = len(new_stss) - stss_sz
+    else:
+        stss_delta = 0
 
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
@@ -403,7 +416,7 @@ def inflate_sample_table_video(data, multiplier=5):
     stsz_delta = len(new_stsz) - stsz_sz
     stco_delta = fake_count * 4
     stsc_delta = 12
-    moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
+    moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta + stss_delta
 
     new_stco_count = orig_stco_count + fake_count
 
@@ -437,6 +450,8 @@ def inflate_sample_table_video(data, multiplier=5):
         (stsc_off, stsc_sz, new_stsc),
         (stco_off, stco_sz, new_stco2),
     ]
+    if new_stss is not None:
+        replacements.append((stss_off, stss_sz, new_stss))
     replacements.sort(key=lambda x: x[0])
 
     filler_total = fake_count * len(FILLER_NAL)
@@ -675,10 +690,10 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func("[TKHD] done")
 
-    # ── Pass 6: Frame Count Inflation (stsz-only) ──────────────────────────
+    # ── Pass 6: Frame Count Inflation (avcC bump + single-entry stts) ─────────
     if log_func:
         log_func("")
-        log_func("── 6/7  Frame Count Inflation (stsz-only, 5x) ─────────────")
+        log_func("── 6/7  Frame Count Inflation (avcC 6.2, stts 300fps) ──────")
     inflated = inflate_sample_table_video(data, multiplier=5)
     if inflated is None:
         if log_func:
