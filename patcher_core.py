@@ -464,26 +464,19 @@ def inflate_sample_table_video(data, multiplier=5):
             struct.pack_into('>I', new_stsz_body, base + (1 + j) * 4, FILLER_NAL_SIZE)
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
-    stts_delta = len(new_stts) - stts_sz
-    stsz_delta = len(new_stsz) - stsz_sz
-    stco_delta = (total_count - orig_stco_count) * 4
-    stsc_delta = 0  # no extra entry — stsc unchanged
-    moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
-
-    new_stco_count = total_count  # one entry per total frame (interleaved)
-
-    # Keep original stsc as-is — all chunks have 1 sample, no extra entry needed
-    stsc_entry_count = int.from_bytes(data[stsc_off+12:stsc_off+16], 'big')
-    new_stsc_body = bytearray(8 + stsc_entry_count * 12)
-    struct.pack_into('>II', new_stsc_body, 0, 0, stsc_entry_count)
-    base = stsc_off + 16
-    for i in range(stsc_entry_count):
-        for j in range(3):
-            val = int.from_bytes(data[base+i*12+j*4:base+i*12+j*4+4], 'big')
-            struct.pack_into('>I', new_stsc_body, 8 + i*12 + j*4, val)
+    # Replace stsc: all chunks have 1 sample
+    new_stsc_body = struct.pack('>II', 0, 1)
+    new_stsc_body += struct.pack('>III', 1, 1, 1)
     new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
 
-    # Build interleaved stco: real_offset, filler_pos×4, real_offset, ...
+    new_stco_count = total_count
+    stts_delta = len(new_stts) - stts_sz
+    stsz_delta = len(new_stsz) - stsz_sz
+    stco_delta = (new_stco_count - orig_stco_count) * 4
+    stsc_delta = len(new_stsc) - stsc_sz
+    moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
+
+    # Build interleaved stco
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     fake_idx = 0
