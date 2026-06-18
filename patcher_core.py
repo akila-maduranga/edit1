@@ -388,13 +388,16 @@ def inflate_sample_table_video(data, multiplier=5):
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Read real frame sizes and chunk offsets
+    orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
     uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
     real_sizes = []
     for i in range(real_count):
         if uniform_size != 0:
             real_sizes.append(uniform_size)
-        else:
+        elif i < orig_stsz_count:
             real_sizes.append(int.from_bytes(data[stsz_off+20+i*4:stsz_off+24+i*4], 'big'))
+        else:
+            real_sizes.append(uniform_size if uniform_size else 0)
 
     stco_vals = []
     for i in range(orig_stco_count):
@@ -402,14 +405,8 @@ def inflate_sample_table_video(data, multiplier=5):
 
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
-    uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
-    real_sizes_off = stsz_off + 20
     for i in range(real_count):
-        if uniform_size != 0:
-            val = uniform_size
-        else:
-            val = int.from_bytes(data[real_sizes_off+i*4:real_sizes_off+i*4+4], 'big')
-        struct.pack_into('>I', new_stsz_body, 12 + i*4, val)
+        struct.pack_into('>I', new_stsz_body, 12 + i*4, real_sizes[i])
     for i in range(fake_count):
         struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, real_sizes[i % real_count])
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
