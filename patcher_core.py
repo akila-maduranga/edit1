@@ -345,11 +345,10 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation: Original approach with filler NALs.
-    Real frames at original delta, filler at delta=750.
-    Container durations clipped to real duration.
-    Unique stco entries — no compression.
+def inflate_sample_table_video(data, multiplier=1.1):
+    """1.1x inflation: Very subtle approach to avoid TikTok transcoder detection.
+    Real frames at original delta, fake frames at delta=1.
+    Fake frames point to last real frame to avoid decode errors.
     """
     data = _patch_avcC_sps(data)
 
