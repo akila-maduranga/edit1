@@ -268,7 +268,7 @@ def fingerprint_tkhd(data):
 
 # ── Frame Density Inflation (5x, avcC bump + single-entry stts) ────────
 
-FILLER_NAL = b'\x00\x00\x00\x01\x0c\x00\x00\x80'
+FILLER_NAL = b'\x00\x00\x00\x01\x0c\xff\x80'
 
 def _bump_avcC_level(data):
     """Raise avcC level from e.g. 5.1→6.2 so TikTok accepts higher fps from stts."""
