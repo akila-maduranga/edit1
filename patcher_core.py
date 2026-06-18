@@ -358,10 +358,9 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
     return result
 
 def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation: two-entry stts + IDR frame copy at end.
-    Filler entries at the end point to UNIQUE copies of IDR frame data
-    appended to the mdat — no freeze (each produces a picture),
-    no decoder crash (unique offsets, no overlap).
+    """5x inflation: two-entry stts + overlapping IDR stco at end.
+    Filler stco entries cycle through existing IDR frame offsets (no data copy).
+    IDR frames are self-contained — decoder handles overlapping entries.
     """
     data = _patch_avcC_sps(data)
 
@@ -419,9 +418,9 @@ def inflate_sample_table_video(data, multiplier=5):
     idr_indices = []
     if stss_off != -1:
         stss_count = int.from_bytes(data[stss_off+12:stss_off+16], 'big')
-        for i in range(min(stss_count, 30)):  # cap at 30 IDRs
+        for i in range(min(stss_count, 30)):
             idx = int.from_bytes(data[stss_off+16+i*4:stss_off+20+i*4], 'big')
-            idr_indices.append(idx - 1)  # convert to 0-indexed
+            idr_indices.append(idx - 1)
     if not idr_indices:
         idr_indices = [0]
 
@@ -429,7 +428,7 @@ def inflate_sample_table_video(data, multiplier=5):
     total_count = real_count * multiplier
     fake_count = total_count - real_count
 
-    fake_delta = 750  # 120fps — proven to pass processing
+    fake_delta = 750
 
     # Two-entry stts
     new_stts_body = struct.pack('>II', 0, 2)
@@ -437,13 +436,7 @@ def inflate_sample_table_video(data, multiplier=5):
     new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-    # Find mdat for IDR data extraction and extension
-    mdat_off, mdat_sz = _find_box(data, b"mdat")
-    if mdat_off == -1:
-        return None
-    mdat_data_off = mdat_off + 8  # skip size+type header
-
-    # Read real frame sizes and offsets
+    # Read real frame sizes
     orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
     uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
     real_sizes = []
@@ -460,33 +453,14 @@ def inflate_sample_table_video(data, multiplier=5):
     if not real_offsets:
         return None
 
-    # Extract raw IDR frame data from mdat
-    idr_data_list = []
-    for idx in idr_indices:
-        if idx < len(real_sizes):
-            sz = real_sizes[idx]
-            off = real_offsets[idx]
-            idr_data_list.append(bytes(data[off:off+sz]))
-
-    if not idr_data_list:
-        idr_data_list = [bytes(data[real_offsets[0]:real_offsets[0]+real_sizes[0]])]
-
-    # Build filler data by cycling through IDR copies (use bytearray for O(n) append)
-    filler_data = bytearray()
-    filler_sizes = []
-    for i in range(fake_count):
-        d = idr_data_list[i % len(idr_data_list)]
-        filler_data.extend(d)
-        filler_sizes.append(len(d))
-    filler_data = bytes(filler_data)
-
-    # Non-interleaved stsz: all real sizes, then all IDR copy sizes
+    # Non-interleaved stsz
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     for i in range(real_count):
         struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
     for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, filler_sizes[i])
+        idr_idx = idr_indices[i % len(idr_indices)]
+        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, real_sizes[idr_idx])
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
     # Replace stsc: all chunks have 1 sample
@@ -501,15 +475,14 @@ def inflate_sample_table_video(data, multiplier=5):
     stsc_delta = len(new_stsc) - stsc_sz
     moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
 
-    # Non-interleaved stco: all real offsets, then unique offsets into mdat extension
+    # Non-interleaved stco: real offsets, then cycle through existing IDR offsets (overlap OK)
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     for i in range(real_count):
         struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
-
-    filler_file_off = mdat_off + mdat_sz  # where filler starts in ORIGINAL file
     for i in range(fake_count):
-        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, filler_file_off + sum(filler_sizes[:i]))
+        idr_idx = idr_indices[i % len(idr_indices)]
+        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, real_offsets[idr_idx])
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     replacements = [
@@ -540,10 +513,6 @@ def inflate_sample_table_video(data, multiplier=5):
 
     new_moov_end = moov_off + moov_sz + moov_delta
     _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
-
-    # Extend mdat with IDR copy data and update mdat header
-    result.extend(filler_data)
-    struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + len(filler_data))
 
     return bytes(result)
 
