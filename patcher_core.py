@@ -774,7 +774,7 @@ def patch_stsd_bitrate(data, bitrate=100_000_000):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True, brand_spoof_only=False, minimal=False):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True, brand_spoof_only=False, minimal=False, skip_udta=False):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
@@ -849,14 +849,19 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
             log_func("[MVHD] done")
 
         # ── Pass 4: Udta Strip ──────────────────────────────────────
-        if log_func:
-            log_func("")
-            log_func("── 4/7  Udta Strip ──────────────────────────────────────────")
-        before_sz = len(data)
-        data = strip_udta(data)
-        stripped = before_sz - len(data)
-        if log_func:
-            log_func(f"[UDTA] stripped {stripped} bytes" if stripped else "[UDTA] none found")
+        if skip_udta:
+            if log_func:
+                log_func("")
+                log_func("── 4/7  (skipped — skip_udta=True)")
+        else:
+            if log_func:
+                log_func("")
+                log_func("── 4/7  Udta Strip ──────────────────────────────────────────")
+            before_sz = len(data)
+            data = strip_udta(data)
+            stripped = before_sz - len(data)
+            if log_func:
+                log_func(f"[UDTA] stripped {stripped} bytes" if stripped else "[UDTA] none found")
 
         # ── Pass 5: Tkhd fingerprint ────────────────────────────────
         if log_func:

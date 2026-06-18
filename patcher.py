@@ -22,6 +22,8 @@ if __name__ == "__main__":
                    help="Skip avc3, only spoof ftyp brand to M4VH")
     p.add_argument("--minimal", action="store_true",
                    help="Skip mvhd/udta/tkhd passes; only remux + brand + bitrate")
+    p.add_argument("--skip-udta", action="store_true",
+                   help="Skip udta strip but keep mvhd + tkhd")
     args = p.parse_args()
 
     def log(msg):
@@ -30,5 +32,6 @@ if __name__ == "__main__":
     ok = patch_all(args.input, args.output, comment=args.comment, log_func=log,
                    use_inflation=not args.no_inflate,
                    brand_spoof_only=args.brand_only,
-                   minimal=args.minimal)
+                   minimal=args.minimal,
+                   skip_udta=args.skip_udta)
     sys.exit(0 if ok else 1)
