@@ -504,19 +504,21 @@ def inflate_sample_table_video(data, multiplier=5):
     result.extend(filler_data)
     struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + len(filler_data))
 
-    # Clip container durations to real video duration
-    real_sec = total_ticks / 90000.0
-    mvhd_dur = int(real_sec * 1000)
+    # Keep container durations consistent with stts (no clipping)
+    # This prevents freeze by ensuring timing consistency
+    total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
+    total_sec = total_stts_dur / 90000.0
+    mvhd_dur = int(total_sec * 1000)
     mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
     if mvhd_off != -1:
         ver = result[mvhd_off+12]
         if ver == 0:
             mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
-            mvhd_dur = int(real_sec * mvhd_ts)
+            mvhd_dur = int(total_sec * mvhd_ts)
             result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
         else:
             mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
-            mvhd_dur = int(real_sec * mvhd_ts)
+            mvhd_dur = int(total_sec * mvhd_ts)
             result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
 
     for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
@@ -542,11 +544,11 @@ def inflate_sample_table_video(data, multiplier=5):
         if is_video:
             if ver == 0:
                 mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
-                mdhd_dur = int(real_sec * mdhd_ts)
+                mdhd_dur = int(total_sec * mdhd_ts)
                 result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
             else:
                 mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
-                mdhd_dur = int(real_sec * mdhd_ts)
+                mdhd_dur = int(total_sec * mdhd_ts)
                 result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
 
     return bytes(result)
