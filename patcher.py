@@ -24,6 +24,8 @@ if __name__ == "__main__":
                    help="Skip mvhd/udta/tkhd passes; only remux + brand + bitrate")
     p.add_argument("--skip-udta", action="store_true",
                    help="Skip udta strip but keep mvhd + tkhd")
+    p.add_argument("--mul", type=int, default=5,
+                   help="Inflation multiplier (default: 5, lower = less freeze)")
     args = p.parse_args()
 
     def log(msg):
@@ -33,5 +35,5 @@ if __name__ == "__main__":
                    use_inflation=not args.no_inflate,
                    brand_spoof_only=args.brand_only,
                    minimal=args.minimal,
-                   skip_udta=args.skip_udta)
-    sys.exit(0 if ok else 1)
+                   skip_udta=args.skip_udta,
+                   multiplier=args.mul)

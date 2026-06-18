@@ -842,7 +842,7 @@ def patch_stsd_bitrate(data, bitrate=100_000_000):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True, brand_spoof_only=False, minimal=False, skip_udta=False):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True, brand_spoof_only=False, minimal=False, skip_udta=False, multiplier=5):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
@@ -943,7 +943,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         if log_func:
             log_func("")
             log_func("── 6/7  Frame Count Inflation (5x, non-interleaved, duration clip) ─────")
-        inflated = inflate_sample_table_video(data, multiplier=5, original_size=len(original_data))
+        inflated = inflate_sample_table_video(data, multiplier=multiplier, original_size=len(original_data))
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
