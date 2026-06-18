@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Core patching engine — merges binary MP4 patching techniques.
+Core patching engine — implements NoBlur-style 7-pass TikTok bypass.
 
-All 7 target patches:
-  1. Date zeroing       — mvhd/tkhd/mdhd timestamps -> 0
-  2. Language spoofing  — mdhd language field -> 'und'
-  3. Frame inflation    — stsz entries x10 (stco/co64 adjusted)
-  4. Encoder spoofing   -> Lavf60.16.100 via ffmpeg
-  5. Comment injection  -> itunes ilst box
-  6. Free atom insert   -> between ftyp and mdat
-  7. Fake trailer atom  -> 'Unknown trailer with invalid atom size'
+Pipeline:
+  1. FFmpeg remux (Faststart, normalize)
+  2. ZeroLoss Track Bypass (edts/elst rebuild)
+  3. Quantum Matrix Patch (mvhd display matrix)
+  4. Udta Strip (remove ffmpeg encoder signature)
+  5. Tkhd Matrix Reset (identity matrix)
+  6. Frame Density Inflation (5x, 8-byte dummy samples, EOF padding)
+  7. Comment Udta Injection (Apple iTunes-style only)
 """
 
 import struct
@@ -19,246 +19,6 @@ import random
 from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).parent
-
-CONTAINERS = [b'moov', b'trak', b'mdia', b'minf', b'stbl', b'edts', b'udta', b'meta', b'ilst']
-VERSION_ATOMS = [b'meta']
-
-
-def read_atoms_in_range(data, offset, end_pos):
-    atoms = []
-    while offset + 8 <= end_pos and offset + 8 <= len(data):
-        size = int.from_bytes(data[offset:offset+4], 'big')
-        if size == 0:
-            break
-        if size == 1:
-            size = int.from_bytes(data[offset+8:offset+16], 'big')
-            header_size = 16
-        else:
-            header_size = 8
-        atom_end = offset + size
-        if atom_end > end_pos:
-            atom_end = end_pos
-        name = bytes(data[offset+4:offset+8])
-        if name in CONTAINERS:
-            version_offset = 4 if name in VERSION_ATOMS else 0
-            children, _ = read_atoms_in_range(data, offset + header_size + version_offset, atom_end)
-            atoms.append({'name': name, 'children': children, 'start': offset, 'size': size})
-        else:
-            atoms.append({'name': name, 'data': bytes(data[offset+header_size:atom_end]),
-                          'start': offset, 'size': size})
-        offset = atom_end
-    return atoms, offset
-
-
-def find_atom(atoms, path):
-    if not path:
-        return atoms
-    for atom in atoms:
-        if atom['name'] == path[0]:
-            if len(path) == 1:
-                return atom
-            if 'children' in atom:
-                res = find_atom(atom['children'], path[1:])
-                if res:
-                    return res
-    return None
-
-
-def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True, moov_before_mdat=True):
-    moov_pos = data.find(b'moov')
-    if moov_pos < 4:
-        return None
-    moov_size_pos = moov_pos - 4
-    moov_size = int.from_bytes(data[moov_size_pos:moov_size_pos+4], 'big')
-
-    tree, _ = read_atoms_in_range(data, moov_pos + 4, moov_pos + moov_size)
-
-    video_trak = None
-    for atom in tree:
-        if atom['name'] == b'trak':
-            hdlr = find_atom(atom['children'], [b'mdia', b'hdlr'])
-            if hdlr and b'vide' in hdlr['data']:
-                video_trak = atom
-                break
-    if not video_trak:
-        return None
-
-    stbl = find_atom(video_trak['children'], [b'mdia', b'minf', b'stbl'])
-    if not stbl:
-        return None
-    minf = find_atom(video_trak['children'], [b'mdia', b'minf'])
-    mdia = find_atom(video_trak['children'], [b'mdia'])
-
-    stsz = find_atom(stbl['children'], [b'stsz'])
-    if not stsz:
-        return None
-
-    stsz_data = bytearray(stsz['data'])
-    orig_count = int.from_bytes(stsz_data[8:12], 'big')
-    if target_frames is None:
-        target_frames = orig_count * 10
-    diff = target_frames - orig_count
-    if diff <= 0:
-        return data
-
-    new_entries = b'\x00\x00\x00\x00' * diff
-    result = bytearray(data)
-
-    stsz_start_in_file = stsz['start']
-    old_stsz_data_len = len(stsz['data'])
-    stsz_data[8:12] = target_frames.to_bytes(4, 'big')
-    new_stsz_data = bytes(stsz_data) + new_entries
-    growth = len(new_stsz_data) - old_stsz_data_len
-
-    result[stsz_start_in_file + 8:stsz_start_in_file + 8 + old_stsz_data_len] = new_stsz_data
-
-    if stts_overflow:
-        stts = find_atom(stbl['children'], [b'stts'])
-        if stts:
-            stts_start = stts['start']
-            old_stts_data_len = len(stts['data'])
-            stts_data = bytearray(stts['data'])
-            entry_count = int.from_bytes(stts_data[8:12], 'big')
-            stts_data[8:12] = (entry_count + diff).to_bytes(4, 'big')
-            result[stts_start + 8:stts_start + 8 + old_stts_data_len] = bytes(stts_data)
-
-    for parent in [stsz, stbl, minf, mdia, video_trak]:
-        old_sz = parent['size']
-        new_sz = old_sz + growth
-        result[parent['start']:parent['start'] + 4] = new_sz.to_bytes(4, 'big')
-    new_moov_size = moov_size + growth
-    result[moov_size_pos:moov_size_pos+4] = new_moov_size.to_bytes(4, 'big')
-
-    mdat_growth = growth if moov_before_mdat else 0
-    video_stsz_start = stsz['start']
-    for trak in tree:
-        if trak['name'] == b'trak':
-            t_stbl = find_atom(trak['children'], [b'mdia', b'minf', b'stbl'])
-            if not t_stbl:
-                continue
-            for child in t_stbl['children']:
-                if child['name'] == b'stco':
-                    pos_shift = growth if child['start'] > video_stsz_start else 0
-                    co_data = bytearray(child['data'])
-                    entry_count = int.from_bytes(co_data[4:8], 'big')
-                    for i in range(entry_count):
-                        idx = 8 + i * 4
-                        val = int.from_bytes(co_data[idx:idx+4], 'big')
-                        co_data[idx:idx+4] = (val + mdat_growth + pre_shift).to_bytes(4, 'big')
-                    result[child['start'] + pos_shift + 8:
-                           child['start'] + pos_shift + 8 + len(child['data'])] = bytes(co_data)
-                elif child['name'] == b'co64':
-                    pos_shift = growth if child['start'] > video_stsz_start else 0
-                    co_data = bytearray(child['data'])
-                    entry_count = int.from_bytes(co_data[4:8], 'big')
-                    for i in range(entry_count):
-                        idx = 8 + i * 8
-                        val = int.from_bytes(co_data[idx:idx+8], 'big')
-                        co_data[idx:idx+8] = (val + mdat_growth + pre_shift).to_bytes(8, 'big')
-                    result[child['start'] + pos_shift + 8:
-                           child['start'] + pos_shift + 8 + len(child['data'])] = bytes(co_data)
-
-    return bytes(result)
-
-
-def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
-    entries = {}
-    if encoder:
-        entries[b'\xa9too'] = encoder
-    if artist:
-        entries[b'\xa9ART'] = artist
-    if copyright:
-        entries[b'\xa9cpy'] = copyright
-    if custom_tag:
-        entries[b'\xa9cmt'] = custom_tag
-
-    # Build direct udta children (TikTok reads these)
-    udta_data = b''
-    for tag_key, value in entries.items():
-        value_bytes = value.encode('utf-8')
-        tag_box = struct.pack('>I4s', 8 + len(value_bytes), tag_key) + value_bytes
-        udta_data += tag_box
-
-    # Build meta box with handler (type=mdir, vendor=Apple) — empty ilst, no duplicate tags
-    ilst = struct.pack('>I4s', 8, b'ilst')  # empty ilst
-    hdlr = struct.pack('>I4sI', 41, b'hdlr', 0)
-    hdlr += struct.pack('>I4s', 0, b'mdir')
-    hdlr += b'appl' + struct.pack('>II', 0, 0)  # vendor=Apple
-    hdlr += b'Metadata\x00'  # component name
-    meta_content = b'\x00\x00\x00\x00' + hdlr + ilst
-    meta = struct.pack('>I4s', 8 + len(meta_content), b'meta') + meta_content
-    udta_data += meta
-
-    return struct.pack('>I4s', 8 + len(udta_data), b'udta') + udta_data
-
-
-def _zero_timestamps(data, off):
-    bs = off + 8
-    v = data[bs]
-    if v == 0:
-        ct_off, mt_off, fmt, w = bs+4, bs+8, ">I", 4
-    elif v == 1:
-        ct_off, mt_off, fmt, w = bs+4, bs+12, ">Q", 8
-    else:
-        return data
-    p = bytearray(data)
-    struct.pack_into(fmt, p, ct_off, 0)
-    struct.pack_into(fmt, p, mt_off, 0)
-    return bytes(p)
-
-
-def patch_timestamps(data):
-    moov_off, moov_sz = _find_box(data, b"moov")
-    if moov_off == -1:
-        return data
-
-    mvhd_off, _ = _find_box(data, b"mvhd", moov_off+8, moov_off+moov_sz)
-    if mvhd_off != -1:
-        data = _zero_timestamps(data, mvhd_off)
-        moov_off, moov_sz = _find_box(data, b"moov")
-
-    for trak_off, trak_sz, tt in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        if tt != b"trak":
-            continue
-        tkhd_off, _ = _find_box(data, b"tkhd", trak_off+8, trak_off+trak_sz)
-        if tkhd_off != -1:
-            data = _zero_timestamps(data, tkhd_off)
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off != -1:
-            mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
-            if mdhd_off != -1:
-                data = _zero_timestamps(data, mdhd_off)
-    return data
-
-
-def _pack_lang(s):
-    val = 0
-    for c in s:
-        val = (val << 5) | (ord(c) - 0x60)
-    return struct.pack(">H", val)
-
-
-_UND = _pack_lang("und")
-
-
-def patch_language(data):
-    moov_off, moov_sz = _find_box(data, b"moov")
-    if moov_off == -1:
-        return data
-    for trak_off, trak_sz, tt in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        if tt != b"trak":
-            continue
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off == -1:
-            continue
-        mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
-        if mdhd_off == -1:
-            continue
-        lang_off = mdhd_off + 8 + 20
-        p = bytearray(data)
-        p[lang_off:lang_off+2] = _UND
-        data = bytes(p)
-    return data
 
 
 def _iter_boxes(data, start=0, end=None):
@@ -284,7 +44,6 @@ def _find_box(data, box_type, start=0, end=None):
 
 
 def _adjust_stco(data, delta, search_start=0, search_end=None):
-    """Adjust all stco/co64 chunk-offset entries within search range by delta."""
     if search_end is None:
         search_end = len(data)
     pos = search_start
@@ -309,7 +68,6 @@ def _adjust_stco(data, delta, search_start=0, search_end=None):
 
 
 def _dump_atoms(data, label="", log_func=None):
-    """Log all top-level atom positions for debugging."""
     if not log_func:
         return
     i = 0
@@ -325,50 +83,394 @@ def _dump_atoms(data, label="", log_func=None):
             break
 
 
-def relocate_to_non_faststart(data, log_func=None):
-    """Given data in Faststart layout (ftyp | moov | mdat):
-       1. Insert free(8) after ftyp
-       2. Adjust stco/co64 by -(moov_size - 8)
-       3. Physically move moov to end
-       Returns bytearray in Non-Faststart layout (ftyp | free | mdat | moov).
-    """
-    if log_func:
-        log_func("[RELOC] Initial layout (before relocation):")
-        _dump_atoms(data, "BEFORE", log_func)
+# ── ZeroLoss Track Bypass (edts/elst rebuild) ──────────────────────────
+
+def build_edts_atom(duration, media_time=0):
+    elst_size = 36 if duration > 0xffffffff else 28
+    edts_size = 8 + elst_size
+    buf = bytearray(edts_size)
+    struct.pack_into('>I4s', buf, 0, edts_size, b'edts')
+    struct.pack_into('>I4s', buf, 8, elst_size, b'elst')
+    if duration > 0xffffffff:
+        struct.pack_into('>I', buf, 16, 0x01000000)
+        struct.pack_into('>I', buf, 20, 1)
+        struct.pack_into('>Q', buf, 24, duration)
+        struct.pack_into('>q', buf, 32, media_time)
+        struct.pack_into('>I', buf, 40, 0x00010000)
+    else:
+        struct.pack_into('>I', buf, 16, 0)
+        struct.pack_into('>I', buf, 20, 1)
+        struct.pack_into('>I', buf, 24, duration)
+        struct.pack_into('>i', buf, 28, media_time)
+        struct.pack_into('>I', buf, 32, 0x00010000)
+    return bytes(buf)
+
+
+def rebuild_elst_bypass(data):
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
 
     data = bytearray(data)
+    modifications = []
 
-    # 1. Insert free(8) after ftyp
-    ftyp_size = int.from_bytes(data[0:4], 'big')
-    free_atom = b'\x00\x00\x00\x08free'
-    data[ftyp_size:ftyp_size] = free_atom  # now: ftyp | free | moov | mdat
-    if log_func:
-        log_func(f"[RELOC] Inserted free(8) after ftyp (ftyp_size={ftyp_size})")
+    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+        tkhd_off, _ = _find_box(data, b"tkhd", trak_off+8, trak_off+trak_sz)
+        if tkhd_off == -1:
+            continue
+        version = data[tkhd_off+8]
+        if version == 1:
+            duration = int.from_bytes(data[tkhd_off+36:tkhd_off+44], 'big')
+        else:
+            duration = int.from_bytes(data[tkhd_off+28:tkhd_off+32], 'big')
 
-    # 2. Find moov (right after free)
-    moov_start = ftyp_size + 8
-    moov_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
-    if log_func:
-        log_func(f"[RELOC] moov at offset {moov_start}, size={moov_size}")
-        log_func(f"[RELOC] stco adjustment delta = -(M-8) = -({moov_size}-8) = {-(moov_size-8)}")
-    delta = -(moov_size - 8)  # = -(M - 8): correct for relocation + free atom
-    _adjust_stco(data, delta, moov_start, moov_start + moov_size)
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+        media_time = 0
+        if mdhd_off != -1:
+            v = data[mdhd_off+8]
+            ts_off = mdhd_off + (24 if v == 0 else 32)
+            timescale = int.from_bytes(data[ts_off:ts_off+4], 'big')
+            if timescale == 90000:
+                media_time = 6000
 
-    # 3. Physically move moov to end
-    end = moov_start + moov_size
-    moov_box = data[moov_start:end]
-    del data[moov_start:end]
-    data.extend(moov_box)
+        edts_bytes = build_edts_atom(duration, media_time)
+        edts_off, edts_sz = _find_box(data, b"edts", trak_off+8, trak_off+trak_sz)
+        if edts_off != -1:
+            modifications.append((edts_off, edts_sz, edts_bytes, trak_off))
+        else:
+            modifications.append((mdia_off, 0, edts_bytes, trak_off))
 
-    if log_func:
-        log_func("[RELOC] Final layout (after relocation):")
-        _dump_atoms(data, "AFTER", log_func)
+    modifications.sort(key=lambda x: x[0])
+    if not modifications:
+        return bytes(data)
 
-    return data
+    total_delta = sum(len(m[2]) - m[1] for m in modifications)
+    new_data = bytearray(len(data) + total_delta)
+    read_pos = 0
+    write_pos = 0
+    for off, old_sz, new_bytes, trak_off in modifications:
+        new_data[write_pos:write_pos + off - read_pos] = data[read_pos:off]
+        write_pos += off - read_pos
+        new_data[write_pos:write_pos + len(new_bytes)] = new_bytes
+        write_pos += len(new_bytes)
+        read_pos = off + old_sz
+    new_data[write_pos:] = data[read_pos:]
 
+    cum_delta = 0
+    done_traks = set()
+    for off, old_sz, new_bytes, trak_off in modifications:
+        if trak_off in done_traks:
+            cum_delta += len(new_bytes) - old_sz
+            continue
+        done_traks.add(trak_off)
+        trak_sz = int.from_bytes(new_data[trak_off:trak_off+4], 'big')
+        struct.pack_into('>I', new_data, trak_off, trak_sz + cum_delta)
+        cum_delta += len(new_bytes) - old_sz
+
+    moov_sz = int.from_bytes(new_data[moov_off:moov_off+4], 'big')
+    struct.pack_into('>I', new_data, moov_off, moov_sz + total_delta)
+    _adjust_stco(new_data, total_delta, moov_off+8, moov_off+8+moov_sz+total_delta)
+
+    return bytes(new_data)
+
+
+# ── Quantum Matrix Patch (mvhd display matrix) ─────────────────────────
+
+def patch_mvhd_matrix(data):
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+    mvhd_off, _ = _find_box(data, b"mvhd", moov_off+8, moov_off+moov_sz)
+    if mvhd_off == -1:
+        return data
+    version = data[mvhd_off+8]
+    if version == 0:
+        matrix_off = mvhd_off + 8 + 36
+    elif version == 1:
+        matrix_off = mvhd_off + 8 + 48
+    else:
+        return data
+    if matrix_off + 8 > len(data):
+        return data
+    p = bytearray(data)
+    b_off = matrix_off + 4
+    prev = int.from_bytes(p[b_off:b_off+4], 'big', signed=True)
+    if prev == 0:
+        struct.pack_into('>i', p, b_off, 1)
+    return bytes(p)
+
+
+# ── Udta Strip ─────────────────────────────────────────────────────────
+
+def strip_udta(data):
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+    udta_off, udta_sz = _find_box(data, b"udta", moov_off+8, moov_off+moov_sz)
+    if udta_off == -1:
+        return data
+    data = bytearray(data)
+    del data[udta_off:udta_off+udta_sz]
+    new_moov_sz = moov_sz - udta_sz
+    struct.pack_into('>I', data, moov_off, new_moov_sz)
+    _adjust_stco(data, -udta_sz, moov_off+8, moov_off+8+new_moov_sz)
+    return bytes(data)
+
+
+# ── Tkhd Matrix Reset ──────────────────────────────────────────────────
+
+def reset_tkhd_matrices(data):
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+    p = bytearray(data)
+    for trak_off, trak_sz, _ in _iter_boxes(p, moov_off+8, moov_off+moov_sz):
+        tkhd_off, _ = _find_box(p, b"tkhd", trak_off+8, trak_off+trak_sz)
+        if tkhd_off == -1:
+            continue
+        version = p[tkhd_off+8]
+        if version == 0:
+            matrix_off = tkhd_off + 8 + 40
+        elif version == 1:
+            matrix_off = tkhd_off + 8 + 52
+        else:
+            continue
+        if matrix_off + 36 > len(p):
+            continue
+        struct.pack_into('>I', p, matrix_off, 0x00010000)
+        struct.pack_into('>I', p, matrix_off+4, 0)
+        struct.pack_into('>I', p, matrix_off+8, 0)
+        struct.pack_into('>I', p, matrix_off+12, 0)
+        struct.pack_into('>I', p, matrix_off+16, 0x00010000)
+        struct.pack_into('>I', p, matrix_off+20, 0)
+        struct.pack_into('>I', p, matrix_off+24, 0)
+        struct.pack_into('>I', p, matrix_off+28, 0)
+        struct.pack_into('>I', p, matrix_off+32, 0x40000000)
+    return bytes(p)
+
+
+# ── Frame Density Inflation (5x, 8-byte dummy samples, EOF padding) ────
+
+DUMMY_SAMPLE_SIZE = 8
+
+def inflate_sample_table_video(data, multiplier=5):
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return None
+
+    # Find video stbl
+    video_stbl = None
+    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+        mdia_off, _ = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1:
+            continue
+        if data[hdlr_off+16:hdlr_off+20] != b'vide':
+            continue
+        minf_off, _ = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1:
+            continue
+        stbl_off, stbl_sz = _find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1:
+            continue
+        video_stbl = (stbl_off, stbl_sz, trak_off, mdia_off, minf_off)
+        break
+
+    if video_stbl is None:
+        return None
+
+    stbl_off, stbl_sz, trak_off, mdia_off, minf_off = video_stbl
+    stbl_end = stbl_off + stbl_sz
+
+    stts_off, stts_sz = _find_box(data, b"stts", stbl_off+8, stbl_end)
+    stsz_off, stsz_sz = _find_box(data, b"stsz", stbl_off+8, stbl_end)
+    stco_off, stco_sz = _find_box(data, b"stco", stbl_off+8, stbl_end)
+    stsc_off, stsc_sz = _find_box(data, b"stsc", stbl_off+8, stbl_end)
+
+    if -1 in (stts_off, stsz_off, stco_off, stsc_off):
+        return None
+
+    # Read original sample count from stts
+    stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
+    if stts_entry_count != 1:
+        return None
+
+    real_count = int.from_bytes(data[stts_off+16:stts_off+20], 'big')
+    sample_delta = int.from_bytes(data[stts_off+20:stts_off+24], 'big')
+    if real_count == 0:
+        return None
+
+    orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
+    total_count = real_count * multiplier
+    fake_count = total_count - real_count
+
+    # Build stts: 2 entries (real + fake)
+    new_stts_data = struct.pack('>IIII', 0, 2, real_count, sample_delta) + \
+                    struct.pack('>II', fake_count, sample_delta)
+    new_stts = struct.pack('>I4s', 16 + len(new_stts_data), b'stts') + new_stts_data
+
+    # Build stsz: all entries (real sizes + 8-byte dummy)
+    stsz_body = data[stsz_off+8:stsz_off+20]  # version/flags + uniform_size + count
+    uniform_size = int.from_bytes(stsz_body[4:8], 'big')
+    real_sizes_off = stsz_off + 20
+    new_stsz_body = bytearray(20 + total_count * 4)
+    struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
+    for i in range(real_count):
+        val = int.from_bytes(data[real_sizes_off+i*4:real_sizes_off+i*4+4], 'big')
+        struct.pack_into('>I', new_stsz_body, 12 + i*4, val)
+    for i in range(fake_count):
+        struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, DUMMY_SAMPLE_SIZE)
+    new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
+
+    # We'll compute stco delta and safe offset later
+    # First compute deltas without stco to know total moov delta
+    stts_delta = len(new_stts) - stts_sz
+    stsz_delta = len(new_stsz) - stsz_sz
+    stco_delta = fake_count * 4  # each new chunk gets a 4-byte entry
+    stsc_delta = 12  # +1 entry (12 bytes)
+    pre_stco_moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
+
+    safe_offset = len(data) + pre_stco_moov_delta + fake_count * DUMMY_SAMPLE_SIZE
+
+    # Build stco: original entries + fake entries pointing to safe_offset
+    new_stco_count = orig_stco_count + fake_count
+    new_stco_body = bytearray(8 + new_stco_count * 4)
+    struct.pack_into('>II', new_stco_body, 0, 0, new_stco_count)
+    base = stco_off + 16
+    for i in range(orig_stco_count):
+        val = int.from_bytes(data[base+i*4:base+i*4+4], 'big')
+        struct.pack_into('>I', new_stco_body, 8 + i*4, val + pre_stco_moov_delta)
+    for i in range(fake_count):
+        struct.pack_into('>I', new_stco_body, 8 + orig_stco_count*4 + i*4, safe_offset)
+    new_stco = struct.pack('>I4s', 8 + len(new_stco_body), b'stco') + bytes(new_stco_body)
+
+    # Build stsc: original entries + 1 extra for fake chunks
+    stsc_entry_count = int.from_bytes(data[stsc_off+12:stsc_off+16], 'big')
+    new_stsc_entry_count = stsc_entry_count + 1
+    new_stsc_body = bytearray(8 + new_stsc_entry_count * 12)
+    struct.pack_into('>II', new_stsc_body, 0, 0, new_stsc_entry_count)
+    base = stsc_off + 16
+    for i in range(stsc_entry_count):
+        for j in range(3):
+            val = int.from_bytes(data[base+i*12+j*4:base+i*12+j*4+4], 'big')
+            struct.pack_into('>I', new_stsc_body, 8 + i*12 + j*4, val)
+    extra_first_chunk = orig_stco_count + 1
+    struct.pack_into('>III', new_stsc_body, 8 + stsc_entry_count*12, extra_first_chunk, 1, 1)
+    new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
+
+    moov_delta = pre_stco_moov_delta
+    # Rebuild stco with correct safe_offset (after all moov changes + padding)
+    safe_offset = len(data) + moov_delta + fake_count * DUMMY_SAMPLE_SIZE
+    new_stco_body2 = bytearray(8 + new_stco_count * 4)
+    struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
+    for i in range(orig_stco_count):
+        val = int.from_bytes(data[base+i*4:base+i*4+4], 'big')
+        struct.pack_into('>I', new_stco_body2, 8 + i*4, val + moov_delta)
+    for i in range(fake_count):
+        struct.pack_into('>I', new_stco_body2, 8 + orig_stco_count*4 + i*4, safe_offset)
+    new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
+
+    # Replace atoms in order: stts, stsz, stsc, stco
+    replacements = [
+        (stts_off, stts_sz, new_stts),
+        (stsz_off, stsz_sz, new_stsz),
+        (stsc_off, stsc_sz, new_stsc),
+        (stco_off, stco_sz, new_stco2),
+    ]
+    replacements.sort(key=lambda x: x[0])
+
+    padding_size = fake_count * DUMMY_SAMPLE_SIZE
+    new_size = len(data) + moov_delta + padding_size
+    result = bytearray(new_size)
+
+    read_pos = 0
+    write_pos = 0
+    for off, old_sz, new_bytes in replacements:
+        result[write_pos:write_pos + off - read_pos] = data[read_pos:off]
+        write_pos += off - read_pos
+        result[write_pos:write_pos + len(new_bytes)] = new_bytes
+        write_pos += len(new_bytes)
+        read_pos = off + old_sz
+    result[write_pos:write_pos + len(data) - read_pos] = data[read_pos:]
+    write_pos += len(data) - read_pos
+
+    # Update container sizes
+    for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
+        old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
+        struct.pack_into('>I', result, container_off, old_sz + moov_delta)
+
+    # Adjust non-video stco entries
+    new_moov_end = moov_off + moov_sz + moov_delta
+    _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
+
+    # Write EOF padding for dummy samples
+    result[write_pos:write_pos + padding_size] = b'\x00' * padding_size
+
+    return bytes(result)
+
+
+# ── Comment Udta Injection (meta/ilst, only \xa9cmt) ───────────────────
+
+def build_comment_udta(comment):
+    comment_bytes = comment.encode('utf-8')
+    data_size = 16 + len(comment_bytes)
+    cmt_size = 8 + data_size
+    ilst_size = 8 + cmt_size
+    hdlr_size = 33
+    meta_size = 12 + hdlr_size + ilst_size
+    udta_size = 8 + meta_size
+
+    buf = bytearray(udta_size)
+    p = 0
+
+    struct.pack_into('>I4s', buf, p, udta_size, b'udta'); p += 8
+    struct.pack_into('>I4sI', buf, p, meta_size, b'meta', 0); p += 12
+
+    struct.pack_into('>I4sI', buf, p, hdlr_size, b'hdlr', 0); p += 12
+    struct.pack_into('>I', buf, p, 0); p += 4      # pre_defined
+    struct.pack_into('>4s', buf, p, b'mdir'); p += 4  # handler_type
+    struct.pack_into('>4s', buf, p, b'appl'); p += 4  # vendor
+    struct.pack_into('>II', buf, p, 0, 0); p += 8    # reserved
+    buf[p] = 0; p += 1                               # name (empty)
+
+    struct.pack_into('>I4s', buf, p, ilst_size, b'ilst'); p += 8
+
+    struct.pack_into('>I4s', buf, p, cmt_size, b'\xa9cmt'); p += 8
+    struct.pack_into('>I4sII', buf, p, data_size, b'data', 1, 0); p += 16
+    buf[p:p+len(comment_bytes)] = comment_bytes
+
+    return bytes(buf)
+
+
+def inject_comment_udta(data, comment):
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+
+    udta_bytes = build_comment_udta(comment)
+    delta = len(udta_bytes)
+    moov_end = moov_off + moov_sz
+
+    result = bytearray(len(data) + delta)
+    result[0:moov_end] = data[:moov_end]
+    result[moov_end:moov_end+delta] = udta_bytes
+    result[moov_end+delta:] = data[moov_end:]
+
+    new_moov_sz = moov_sz + delta
+    struct.pack_into('>I', result, moov_off, new_moov_sz)
+    _adjust_stco(result, delta, moov_off+8, moov_off+8+new_moov_sz)
+
+    return bytes(result)
+
+
+# ── Audio duration helpers ─────────────────────────────────────────────
 
 def read_audio_duration(data):
-    """Read the audio track's mdhd duration from file data."""
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
@@ -402,7 +504,6 @@ def read_audio_duration(data):
 
 
 def patch_audio_duration(data, original_duration):
-    """Restore audio track mdhd duration in patched data."""
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
@@ -434,9 +535,11 @@ def patch_audio_duration(data, original_duration):
     return data
 
 
+# ── Main 7-Pass Pipeline ──────────────────────────────────────────────
+
 def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
-        log_func("[JOB] starting patch pipeline")
+        log_func("[JOB] starting NoBlur 7-pass pipeline")
 
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -448,16 +551,15 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         tag = f"{ts}_{random.randint(0, 0xFFFFFFFF):08x}"
         comment = f"Patched by method.akila - {tag}"
 
-    # Save original audio duration before ffmpeg remux
     original_data = input_path.read_bytes()
     original_audio_dur = read_audio_duration(original_data)
     if log_func and original_audio_dur is not None:
         log_func(f"[AUDIO] original duration={original_audio_dur}")
 
-    # ---- 1. Remux to Faststart via ffmpeg -movflags +faststart ----
+    # ── Pass 1: FFmpeg remux (Faststart, normalize) ──────────────────────
     if log_func:
         log_func("")
-        log_func("── 1/8  Remux (Faststart, normalize layout) ──────────────────────")
+        log_func("── 1/7  FFmpeg remux (Faststart) ───────────────────────────")
     clean = input_path.parent / f"{stem}_clean{suffix}"
     cmd = [
         "ffmpeg", "-y",
@@ -482,165 +584,90 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func("[REMUX] done")
 
-    # ---- 2. Read clean file (moov at end) ----
     data = clean.read_bytes()
     if log_func:
         log_func(f"[READ] {len(data):,} bytes")
-        log_func("[LAYOUT] After ffmpeg remux:")
-        _dump_atoms(data, "REMUX", log_func)
-        md = data.find(b'mdat')
-        mv = data.find(b'moov')
-        log_func(f"[CHECK] mdat at {md}, moov at {mv}, moov at front: {'YES' if mv < md else 'NO'}")
+        _dump_atoms(data, "REBASE", log_func)
 
-    # ---- 3. Insert free atom after ftyp (for Faststart, this shifts mdat into correct position) ----
+    # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ────────────────
     if log_func:
         log_func("")
-        log_func("── 2/8  Insert free atom after ftyp ───────────────────────────")
-    ftyp_size = int.from_bytes(data[0:4], 'big')
-    # Check whether ffmpeg already placed a free atom after ftyp
-    next_type = data[ftyp_size+4:ftyp_size+8]
-    if next_type == b'free':
+        log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
+    data = rebuild_elst_bypass(data)
+    if log_func:
+        log_func("[ELST] done")
+
+    # ── Pass 3: Quantum Matrix Patch (mvhd matrix) ──────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 3/7  Quantum Matrix Patch (mvhd) ───────────────────────")
+    data = patch_mvhd_matrix(data)
+    if log_func:
+        log_func("[MVHD] done")
+
+    # ── Pass 4: Udta Strip ──────────────────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 4/7  Udta Strip ──────────────────────────────────────────")
+    before_sz = len(data)
+    data = strip_udta(data)
+    stripped = before_sz - len(data)
+    if log_func:
+        log_func(f"[UDTA] stripped {stripped} bytes" if stripped else "[UDTA] none found")
+
+    # ── Pass 5: Tkhd Matrix Reset ───────────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 5/7  Tkhd Matrix Reset ──────────────────────────────────")
+    data = reset_tkhd_matrices(data)
+    if log_func:
+        log_func("[TKHD] done")
+
+    # ── Pass 6: Frame Density Inflation (5x, 8-byte dummy, EOF padding) ──
+    if log_func:
+        log_func("")
+        log_func("── 6/7  Frame Density Inflation (5x) ───────────────────────")
+    inflated = inflate_sample_table_video(data, multiplier=5)
+    if inflated is None:
         if log_func:
-            log_func("[PATCH] free atom already present after ftyp — skipping insertion")
-        pre_shift_extra = 0
-    else:
-        data = data[:ftyp_size] + b'\x00\x00\x00\x08free' + data[ftyp_size:]
-        if log_func:
-            log_func("[PATCH] free atom inserted (size=8)")
-        pre_shift_extra = 8
-
-    # ---- 4. Date zeroing ----
-    if log_func:
-        log_func("")
-        log_func("── 3/8  Date zeroing (mvhd/tkhd/mdhd) ─────────────────────────")
-    data = patch_timestamps(data)
-
-    # ---- 5. Language spoofing -> und ----
-    if log_func:
-        log_func("")
-        log_func("── 4/8  Language spoofing -> 'und' ────────────────────────────")
-    data = patch_language(data)
-
-    # ---- 6. Frame count inflation (10x) ----
-    if log_func:
-        log_func("")
-        log_func(f"── 5/8  Frame inflation (10x, stts overflow) ──────────────────")
-    md_tree = build_metadata_tree("akila", "akila", comment)
-    md_growth = len(md_tree)
-    # Faststart: free atom shifts moov+mdat; moov is before mdat
-    patched = inject_fake_frames(data, pre_shift=pre_shift_extra, stts_overflow=True, moov_before_mdat=True)
-    if patched is None:
-        if log_func:
-            log_func("[ERROR] Frame injection failed")
+            log_func("[ERROR] Frame inflation failed")
         try: clean.unlink(missing_ok=True)
         except: pass
         return False
-    data = bytearray(patched)
+    data = inflated
+    if log_func:
+        log_func("[INFLATE] done")
 
-    # ---- 7. Inject metadata (ilst) — replace existing udta or append ----
+    # ── Pass 7: Comment Udta Injection ───────────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 6/8  Inject metadata (ilst box) ─────────────────────────────")
-    moov_idx = data.find(b'moov')
-    moov_start = moov_idx - 4
-    current_size = int.from_bytes(data[moov_start:moov_start+4], 'big')
-    moov_end = moov_start + current_size
-
-    # Search for existing udta inside moov and remove it
-    pos = moov_start + 8
-    udta_removed = 0
-    while pos + 8 <= moov_end:
-        atom_size = int.from_bytes(data[pos:pos+4], 'big')
-        atom_type = data[pos+4:pos+8]
-        if atom_size < 8:
-            break
-        if atom_type == b'udta':
-            del data[pos:pos + atom_size]
-            udta_removed = atom_size
-            current_size -= udta_removed
-            moov_end -= udta_removed
-            break
-        pos += atom_size
-
-    # Append metadata tree (starts with udta) at end of moov
-    data[moov_end:moov_end] = md_tree
-    new_size = current_size + md_growth
-    data[moov_start:moov_start+4] = new_size.to_bytes(4, 'big')
-    # Adjust stco for the net shift in moov size (md_growth - udta_removed)
-    net_shift = md_growth - udta_removed
-    if net_shift != 0:
-        _adjust_stco(data, net_shift, moov_start, moov_start + new_size)
+        log_func("── 7/7  Comment Udta Injection ─────────────────────────────")
+    data = inject_comment_udta(data, comment)
     if log_func:
-        log_func(f"[PATCH] metadata injected: moov {current_size} -> {new_size}"
-                 f"  (removed udta={udta_removed}, added={md_growth}, net={net_shift:+d})")
+        log_func("[COMMENT] injected")
 
-    # ---- 8. Expand padding after ftyp, remove moov-mdat free ----
-    if log_func:
-        log_func("")
-        log_func("── 7/8  Expand padding after ftyp, target offset=237436 ────────")
-    target_offset = 237436
-    ftyp_size = int.from_bytes(data[0:4], 'big')
-    # Our free(8) is at ftyp_size (inserted at step 3)
-    if data[ftyp_size:ftyp_size+8] != b'\x00\x00\x00\x08free':
-        if log_func:
-            log_func("[PADDING] expected free(8) after ftyp not found — skipping")
-    else:
-        moov_end = moov_start + new_size
-        needed_free = target_offset - 40 - new_size  # 40=ftyp+free+mdat_hdr
-        if needed_free < 8:
-            if log_func:
-                log_func(f"[PADDING] offset already >= {target_offset} — no change needed")
-        else:
-            # Remove ffmpeg's free(8) between moov and mdat (shifts mdat left by 8)
-            ffmpeg_free_removed = 0
-            if data[moov_end:moov_end+8] == b'\x00\x00\x00\x08free':
-                del data[moov_end:moov_end + 8]
-                ffmpeg_free_removed = 8
-                if log_func:
-                    log_func("[PADDING] removed moov-mdat free(8)")
-            # Expand our free after ftyp: free(8) -> free(needed_free)
-            new_free = struct.pack('>I4s', needed_free, b'free') + b'\x00' * (needed_free - 8)
-            data[ftyp_size:ftyp_size+8] = new_free
-            shift = needed_free - 8
-            moov_start += shift
-            stco_delta = shift - ffmpeg_free_removed
-            new_moov_end = moov_start + new_size
-            if stco_delta != 0:
-                _adjust_stco(data, stco_delta, moov_start, new_moov_end)
-            if log_func:
-                log_func(f"[PADDING] free(8) -> free({needed_free})  (stco delta={stco_delta:+d})")
-
-    # ---- 9. Fake trailer atom ----
-    if log_func:
-        log_func("")
-        log_func("── 8/8  Fake trailer atom ───────────────────────────────────────")
-    data += b'\x00\x00\x00\x04xxxx'
-    if log_func:
-        log_func("[PATCH] fake trailer atom appended (size=4)")
-
-    # Restore original audio duration (ffmpeg may truncate it)
+    # Restore original audio duration
     if original_audio_dur is not None:
-        fixed = patch_audio_duration(bytes(data), original_audio_dur)
+        fixed = patch_audio_duration(data, original_audio_dur)
         if fixed is not None:
-            data = bytearray(fixed)
+            data = fixed
             if log_func:
                 log_func(f"[AUDIO] restored duration to {original_audio_dur}")
 
-    # ---- 10. Final verify ----
+    # Final verify
     if log_func:
         log_func("")
-        log_func("── Atom layout ────────────────────────────────────────────────────")
+        log_func("── Atom layout ───────────────────────────────────────────────")
         _dump_atoms(data, "FINAL", log_func)
         md = data.find(b'mdat')
         mv = data.find(b'moov')
         log_func(f"[VERIFY] mdat at {md}, moov at {mv}, moov at front: {'YES' if mv < md else 'NO'}")
+        log_func(f"[VERIFY] file size: {len(data):,} bytes")
 
-    # ---- 11. Write final output ----
-    output_path.write_bytes(bytes(data))
+    output_path.write_bytes(data)
     if log_func:
         log_func(f"[WRITE] {output_path.name}  ({len(data):,} bytes)")
 
-    # Cleanup
     try: clean.unlink(missing_ok=True)
     except: pass
 
