@@ -471,13 +471,14 @@ def inflate_sample_table_video(data, multiplier=5):
     if not idr_data_list:
         idr_data_list = [bytes(data[real_offsets[0]:real_offsets[0]+real_sizes[0]])]
 
-    # Build filler data by cycling through IDR copies
-    filler_data = b''
+    # Build filler data by cycling through IDR copies (use bytearray for O(n) append)
+    filler_data = bytearray()
     filler_sizes = []
     for i in range(fake_count):
         d = idr_data_list[i % len(idr_data_list)]
-        filler_data += d
+        filler_data.extend(d)
         filler_sizes.append(len(d))
+    filler_data = bytes(filler_data)
 
     # Non-interleaved stsz: all real sizes, then all IDR copy sizes
     new_stsz_body = bytearray(20 + total_count * 4)
