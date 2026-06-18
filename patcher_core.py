@@ -422,9 +422,11 @@ def inflate_sample_table_video(data, multiplier=5):
     fake_per_real = multiplier - 1  # 4 filler NALs per real frame
     fake_delta = 750  # 120fps — proven to pass processing
 
-    # Single-entry stts: all frames at delta=750 (120fps)
-    new_stts_body = struct.pack('>II', 0, 1)
-    new_stts_body += struct.pack('>II', total_count, fake_delta)
+    # Interleaved stts: (1 real @ original delta, 4 filler @ 750) × 947
+    new_stts_body = struct.pack('>II', 0, real_count * 2)  # 1894 entries
+    for _ in range(real_count):
+        new_stts_body += struct.pack('>II', 1, last_delta)   # 1 real frame
+        new_stts_body += struct.pack('>II', fake_per_real, fake_delta)  # 4 filler
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Find mdat for fake frame data (filler NALs appended after real mdat)
