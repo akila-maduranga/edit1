@@ -363,7 +363,7 @@ def inflate_sample_table_video(data, multiplier=5):
     moov_delta = pre_stco_moov_delta
     # Rebuild stco — offsets as raw original values; _adjust_stco at end adds moov_delta to all stco entries
     stco_base = stco_off + 16
-    safe_offset = len(data)  # first EOF padding byte; _adjust_stco will add moov_delta
+    safe_offset = len(data) + 8  # after free atom header; _adjust_stco adds moov_delta
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     for i in range(orig_stco_count):
@@ -383,7 +383,7 @@ def inflate_sample_table_video(data, multiplier=5):
     replacements.sort(key=lambda x: x[0])
 
     padding_size = fake_count * DUMMY_SAMPLE_SIZE
-    new_size = len(data) + moov_delta + padding_size
+    new_size = len(data) + moov_delta + 8 + padding_size  # +8 for free atom header
     result = bytearray(new_size)
 
     read_pos = 0
@@ -406,9 +406,10 @@ def inflate_sample_table_video(data, multiplier=5):
     new_moov_end = moov_off + moov_sz + moov_delta
     _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-    # Write EOF padding for dummy samples (random data, not zeros)
+    # Write EOF padding as free atom for valid top-level atom parsing
     if padding_size:
-        result[write_pos:write_pos + padding_size] = random.randbytes(padding_size)
+        free_data = struct.pack('>I4s', 8 + padding_size, b'free') + random.randbytes(padding_size)
+        result[write_pos:write_pos + len(free_data)] = free_data
 
     return bytes(result)
 
