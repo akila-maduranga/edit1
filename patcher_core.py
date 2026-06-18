@@ -411,14 +411,10 @@ def inflate_sample_table_video(data, multiplier=5):
     new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-    # Find mdat for filler NAL data
+    # Find mdat for filler data
     mdat_off, mdat_sz = _find_box(data, b"mdat")
     if mdat_off == -1:
         return None
-    FILLER_NAL = b'\x00\x00\x00\x01\x0c\x80'  # valid H.264 filler NAL
-    FILLER_NAL_SIZE = 512  # pad to 512 bytes to mimic realistic frame size
-    filler_frame = FILLER_NAL + b'\x00' * (FILLER_NAL_SIZE - len(FILLER_NAL))
-    filler_data = filler_frame * fake_count
 
     # Read real frame sizes
     orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
@@ -436,13 +432,25 @@ def inflate_sample_table_video(data, multiplier=5):
     if not real_offsets:
         return None
 
+    # Find smallest real frame data (use as filler — decoder produces valid picture)
+    min_size_idx = min(range(real_count), key=lambda i: real_sizes[i])
+    min_size = real_sizes[min_size_idx]
+    mdat_data = data[mdat_off+8:mdat_off+mdat_sz]  # skip mdat header
+    # Read the smallest frame's bytes from mdat
+    min_frame_off = real_offsets[min_size_idx] - (mdat_off + 8)
+    if min_frame_off + min_size > len(mdat_data):
+        min_frame_off = 0
+        min_size = min(real_sizes)
+    filler_frame_data = mdat_data[min_frame_off:min_frame_off+min_size]
+    filler_data = filler_frame_data * fake_count
+
     # Non-interleaved stsz: all real, then all filler
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     for i in range(real_count):
         struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
     for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, FILLER_NAL_SIZE)
+        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, min_size)
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
     # stsc: all chunks have 1 sample
@@ -463,7 +471,7 @@ def inflate_sample_table_video(data, multiplier=5):
     for i in range(real_count):
         struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
     for i in range(fake_count):
-        pos = mdat_off + mdat_sz + i * FILLER_NAL_SIZE
+        pos = mdat_off + mdat_sz + i * min_size
         struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
