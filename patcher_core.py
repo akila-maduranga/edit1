@@ -500,6 +500,39 @@ def inflate_sample_table_video(data, multiplier=5, original_size=None):
     if mdat_off != -1:
         struct.pack_into('>I', result, mdat_off, mdat_sz + padding_sz)
 
+    # Clip container durations to real video duration (hide freeze)
+    real_sec = total_duration / 90000.0
+    mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+int.from_bytes(result[moov_off:moov_off+4], 'big'))
+    if mvhd_off != -1:
+        ver = result[mvhd_off+12]
+        if ver == 0:
+            ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
+            result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', int(real_sec * ts))
+        else:
+            ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
+            result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', int(real_sec * ts))
+    for t_off, t_sz, _ in _iter_boxes(result, moov_off+8, moov_off+int.from_bytes(result[moov_off:moov_off+4], 'big')):
+        tkhd_off, _ = _find_box(result, b"tkhd", t_off+8, t_off+t_sz)
+        if tkhd_off != -1:
+            ver = result[tkhd_off+12]
+            if ver == 0:
+                result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', int(real_sec * 1000))
+            else:
+                result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', int(real_sec * 1000))
+        mdia_off, _ = _find_box(result, b"mdia", t_off+8, t_off+t_sz)
+        if mdia_off != -1:
+            hdlr_off, _ = _find_box(result, b"hdlr", mdia_off+8, mdia_off+int.from_bytes(result[mdia_off:mdia_off+4], 'big'))
+            if hdlr_off != -1 and result[hdlr_off+16:hdlr_off+20] == b'vide':
+                mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+int.from_bytes(result[mdia_off:mdia_off+4], 'big'))
+                if mdhd_off != -1:
+                    ver = result[mdhd_off+12]
+                    if ver == 0:
+                        ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
+                        result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', int(real_sec * ts))
+                    else:
+                        ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
+                        result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', int(real_sec * ts))
+
     # Update all NON-video trak stco/co64 with moov_delta
     new_moov_end = moov_off + int.from_bytes(result[moov_off:moov_off+4], 'big')
     for t_off, t_sz, _ in _iter_boxes(result, moov_off+8, new_moov_end):

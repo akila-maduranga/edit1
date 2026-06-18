@@ -268,9 +268,11 @@
     <span class="wordmark-tag">self-hosted</span>
   </div>
   <p class="subtitle">
-    Remuxes MP4 files via ffmpeg stream-copy (+faststart) and applies
-    a binary structural patch — rewriting <code>ftyp</code> brand and clearing
-    <code>mvhd</code> random-access flags — to bypass TikTok's re-upload compression.
+    Remuxes MP4 via ffmpeg stream-copy (+faststart), then runs a 9-pass binary
+    patch pipeline: edts rebuild, mvhd/tkhd fingerprints, UDTA strip, SPS/avcC
+    spoof (High10+6.2), avc1→avc3 codec, M4VH brand, NoBlur-style dummy-frame
+    inflation (multi×), and comment injection. Container durations clipped to
+    real video length to hide dummy sample tails.
   </p>
 </header>
 
@@ -291,19 +293,19 @@
   <div style="display:flex;gap:10px;flex-wrap:wrap">
     <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
       <input type="radio" name="mode" value="inflation" checked>
-      <span>Inflation (5x + avc3 + M4VH)</span>
+      <span>Default (5× dummy frames + avc3 + M4VH + duration clip)</span>
     </label>
     <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
       <input type="radio" name="mode" value="no-inflate">
-      <span>No-inflate (avc3 + M4VH)</span>
+      <span>No-inflate (avc3 + M4VH, 1080p only)</span>
     </label>
     <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
       <input type="radio" name="mode" value="brand-only">
-      <span>Brand-only (M4VH only)</span>
+      <span>Brand-only (M4VH only, experimental)</span>
     </label>
     <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
       <input type="radio" name="mode" value="minimal">
-      <span>Minimal (M4VH + bitrate, no other patches)</span>
+      <span>Minimal (M4VH + bitrate, no fingerprints)</span>
     </label>
   </div>
 
@@ -312,7 +314,7 @@
     <label for="mul-input">Multiplier:</label>
     <input type="number" id="mul-input" value="5" min="2" max="10" step="1"
            style="width:60px;padding:4px 8px;background:var(--surface);border:1px solid var(--border);border-radius:3px;color:var(--text);font-family:var(--mono);font-size:12px">
-    <span style="color:var(--muted)">(higher = more anti-compression, more freeze)</span>
+    <span style="color:var(--muted)">(higher = more anti-compression, can cause freeze)</span>
   </div>
 
   <!-- Run -->
