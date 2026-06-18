@@ -408,7 +408,7 @@ def inflate_sample_table_video(data, multiplier=5):
     for i in range(real_count):
         struct.pack_into('>I', new_stsz_body, 12 + i*4, real_sizes[i])
     for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, real_sizes[i % real_count])
+        struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, real_sizes[i % len(real_sizes)])
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
     stts_delta = len(new_stts) - stts_sz
@@ -438,7 +438,7 @@ def inflate_sample_table_video(data, multiplier=5):
     for i in range(orig_stco_count):
         struct.pack_into('>I', new_stco_body2, 8 + i*4, stco_vals[i])
     for i in range(fake_count):
-        struct.pack_into('>I', new_stco_body2, 8 + orig_stco_count*4 + i*4, stco_vals[i % real_count])
+        struct.pack_into('>I', new_stco_body2, 8 + orig_stco_count*4 + i*4, stco_vals[i % len(stco_vals)])
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     replacements = [
