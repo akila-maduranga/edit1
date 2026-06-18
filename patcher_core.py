@@ -276,13 +276,13 @@ def _bump_avcC_level(data):
     if moov_off == -1:
         return data
     for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        mdia_off, _ = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
         if mdia_off == -1:
             continue
         hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
         if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
             continue
-        minf_off, _ = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        minf_off, minf_sz = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
         if minf_off == -1:
             continue
         stbl_off, stbl_sz = _find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
