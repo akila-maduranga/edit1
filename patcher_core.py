@@ -273,7 +273,7 @@ def fingerprint_tkhd(data):
 
 FILLER_NAL = b'\x00\x00\x00\x01\x0c\x00\x00\x80'  # 8-byte H.264 filler (ignored by decoder)
 
-def inflate_sample_table_video(data, multiplier=3):
+def inflate_sample_table_video(data, multiplier=5):
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
@@ -639,8 +639,8 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ── Pass 6: Frame Density Inflation (5x, 8-byte dummy, EOF padding) ──
     if log_func:
         log_func("")
-        log_func("── 6/7  Frame Density Inflation (3x) ───────────────────────")
-    inflated = inflate_sample_table_video(data)
+        log_func("── 6/7  Frame Density Inflation (5x) ───────────────────────")
+    inflated = inflate_sample_table_video(data, multiplier=5)
     if inflated is None:
         if log_func:
             log_func("[ERROR] Frame inflation failed")
