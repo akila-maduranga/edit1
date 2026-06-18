@@ -179,16 +179,8 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
         tag_box = struct.pack('>I4s', 8 + len(value_bytes), tag_key) + value_bytes
         udta_data += tag_box
 
-    # Build Apple-style meta/ilst/data wrapper for compatibility
-    ilst_data = b''
-    for tag_key, value in entries.items():
-        value_bytes = value.encode('utf-8')
-        data_atom = struct.pack('>I4sII', 16 + len(value_bytes), b'data', 1, 0)
-        data_atom += value_bytes
-        ilst_entry = struct.pack('>I4s', 8 + len(data_atom), tag_key) + data_atom
-        ilst_data += ilst_entry
-
-    ilst = struct.pack('>I4s', 8 + len(ilst_data), b'ilst') + ilst_data
+    # Build meta box with handler (type=mdir, vendor=Apple) — empty ilst, no duplicate tags
+    ilst = struct.pack('>I4s', 8, b'ilst')  # empty ilst
     hdlr = struct.pack('>I4sI', 41, b'hdlr', 0)
     hdlr += struct.pack('>I4s', 0, b'mdir')
     hdlr += b'appl' + struct.pack('>II', 0, 0)  # vendor=Apple
@@ -622,7 +614,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func("")
         log_func("── 8/8  Fake trailer atom ───────────────────────────────────────")
-    data += b'\x00\x00\x00\x04junk'
+    data += b'\x00\x00\x00\x04xxxx'
     if log_func:
         log_func("[PATCH] fake trailer atom appended (size=4)")
 
