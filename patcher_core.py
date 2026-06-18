@@ -295,13 +295,18 @@ def inflate_sample_table_video(data, multiplier=5):
     if -1 in (stts_off, stsz_off, stco_off, stsc_off):
         return None
 
-    # Read original sample count from stts
+    # Read original sample count from stts (support multiple entries)
     stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
-    if stts_entry_count != 1:
-        return None
-
-    real_count = int.from_bytes(data[stts_off+16:stts_off+20], 'big')
-    sample_delta = int.from_bytes(data[stts_off+20:stts_off+24], 'big')
+    real_count = 0
+    last_delta = 0
+    stts_entries = []
+    for i in range(stts_entry_count):
+        off = stts_off + 16 + i * 8
+        cnt = int.from_bytes(data[off:off+4], 'big')
+        delta = int.from_bytes(data[off+4:off+8], 'big')
+        real_count += cnt
+        last_delta = delta
+        stts_entries.append((cnt, delta))
     if real_count == 0:
         return None
 
@@ -309,19 +314,23 @@ def inflate_sample_table_video(data, multiplier=5):
     total_count = real_count * multiplier
     fake_count = total_count - real_count
 
-    # Build stts: 2 entries (real + fake)
-    new_stts_data = struct.pack('>IIII', 0, 2, real_count, sample_delta) + \
-                    struct.pack('>II', fake_count, sample_delta)
-    new_stts = struct.pack('>I4s', 8 + len(new_stts_data), b'stts') + new_stts_data
+    # Build stts: original entries + 1 extra for fake frames
+    new_stts_body = struct.pack('>II', 0, stts_entry_count + 1)  # version/flags + entry_count
+    for cnt, delta in stts_entries:
+        new_stts_body += struct.pack('>II', cnt, delta)
+    new_stts_body += struct.pack('>II', fake_count, last_delta)
+    new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Build stsz: all entries (real sizes + 8-byte dummy)
-    stsz_body = data[stsz_off+8:stsz_off+20]  # version/flags + uniform_size + count
-    uniform_size = int.from_bytes(stsz_body[4:8], 'big')
-    real_sizes_off = stsz_off + 20
+    uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')  # uniform_size at offset+12
     new_stsz_body = bytearray(20 + total_count * 4)
-    struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
+    struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)  # version/flags=0, uniform_size=0, count=total
+    real_sizes_off = stsz_off + 20
     for i in range(real_count):
-        val = int.from_bytes(data[real_sizes_off+i*4:real_sizes_off+i*4+4], 'big')
+        if uniform_size != 0:
+            val = uniform_size
+        else:
+            val = int.from_bytes(data[real_sizes_off+i*4:real_sizes_off+i*4+4], 'big')
         struct.pack_into('>I', new_stsz_body, 12 + i*4, val)
     for i in range(fake_count):
         struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, DUMMY_SAMPLE_SIZE)
