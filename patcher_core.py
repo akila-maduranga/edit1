@@ -537,7 +537,7 @@ def patch_audio_duration(data, original_duration):
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
 def patch_all(input_path, output_path, comment=None, log_func=None,
-              multiplier=2, edts_bypass=True, mvhd_patch=True, tkhd_reset=True):
+              multiplier=2, edts_bypass=True, mvhd_patch=False, tkhd_reset=False):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 

@@ -20,10 +20,10 @@ if __name__ == "__main__":
                    help="Frame inflation multiplier (default: 2)")
     p.add_argument("--no-edts", action="store_true",
                    help="Skip edts/elst ZeroLoss bypass")
-    p.add_argument("--no-mvhd", action="store_true",
-                   help="Skip mvhd matrix patch")
-    p.add_argument("--no-tkhd", action="store_true",
-                   help="Skip tkhd matrix reset")
+    p.add_argument("--mvhd", action="store_true",
+                   help="Enable mvhd matrix patch")
+    p.add_argument("--tkhd", action="store_true",
+                   help="Enable tkhd matrix reset")
     args = p.parse_args()
 
     def log(msg):
@@ -34,7 +34,7 @@ if __name__ == "__main__":
         comment=args.comment, log_func=log,
         multiplier=args.multiplier,
         edts_bypass=not args.no_edts,
-        mvhd_patch=not args.no_mvhd,
-        tkhd_reset=not args.no_tkhd,
+        mvhd_patch=args.mvhd,
+        tkhd_reset=args.tkhd,
     )
     sys.exit(0 if ok else 1)
