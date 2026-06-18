@@ -534,6 +534,59 @@ def patch_audio_duration(data, original_duration):
     return data
 
 
+# ── Timestamp zeroing ─────────────────────────────────────────────────
+
+def patch_timestamps(data):
+    p = bytearray(data)
+    for tgt, ver0_off, ver1_off in [(b'mvhd', 12, 20), (b'tkhd', 12, 20), (b'mdhd', 12, 20)]:
+        pos = 0
+        while True:
+            off = p.find(tgt, pos)
+            if off == -1:
+                break
+            if off < 8:
+                pos = off + 4
+                continue
+            version = p[off + 8]
+            if version == 0:
+                ct_off = off + ver0_off
+                if ct_off + 4 <= len(p):
+                    p[ct_off:ct_off + 4] = b'\x00\x00\x00\x00'
+                mt_off = off + ver0_off + 4
+                if mt_off + 4 <= len(p):
+                    p[mt_off:mt_off + 4] = b'\x00\x00\x00\x00'
+            else:
+                ct_off = off + ver1_off
+                if ct_off + 8 <= len(p):
+                    p[ct_off:ct_off + 8] = b'\x00' * 8
+                mt_off = off + ver1_off + 8
+                if mt_off + 8 <= len(p):
+                    p[mt_off:mt_off + 8] = b'\x00' * 8
+            pos = off + 4
+    return bytes(p)
+
+
+def patch_language(data):
+    p = bytearray(data)
+    pos = 0
+    while True:
+        off = p.find(b'mdhd', pos)
+        if off == -1:
+            break
+        if off < 8:
+            pos = off + 4
+            continue
+        version = p[off + 8]
+        if version == 0:
+            lang_off = off + 28
+        else:
+            lang_off = off + 36
+        if lang_off + 2 <= len(p):
+            p[lang_off:lang_off + 2] = b'\x55\xC4'
+        pos = off + 4
+    return bytes(p)
+
+
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
 def patch_all(input_path, output_path, comment=None, log_func=None,
@@ -660,6 +713,63 @@ def patch_all(input_path, output_path, comment=None, log_func=None,
     data = inject_comment_udta(data, comment)
     if log_func:
         log_func("[COMMENT] injected")
+
+    # ── Date zeroing ─────────────────────────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 8/7  Date Zeroing ─────────────────────────────────────────")
+    data = patch_timestamps(data)
+    if log_func:
+        log_func("[DATE] done")
+
+    # ── Language spoofing ────────────────────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 9/7  Language Spoof ───────────────────────────────────────")
+    data = patch_language(data)
+    if log_func:
+        log_func("[LANG] done")
+
+    # ── Free atom padding (target mdat data offset 237436) ───────────────
+    if log_func:
+        log_func("")
+        log_func("── 10/7  Free Atom Padding ─────────────────────────────────────")
+    target_offset = 237436
+    ftyp_sz = int.from_bytes(data[0:4], 'big')
+    moov_off_p = data.find(b'moov') - 4
+    moov_sz_p = int.from_bytes(data[moov_off_p:moov_off_p + 4], 'big')
+    moov_end = moov_off_p + moov_sz_p
+    # Remove free(8) between moov and mdat if present
+    ffmpeg_free_removed = 0
+    if data[moov_end:moov_end + 8] == b'\x00\x00\x00\x08free':
+        data = data[:moov_end] + data[moov_end + 8:]
+        ffmpeg_free_removed = 8
+        moov_sz_p -= 8
+        struct.pack_into('>I', data, moov_off_p, moov_sz_p)
+    need = target_offset - 40 - moov_sz_p
+    if need >= 8:
+        new_free = struct.pack('>I4s', need, b'free') + b'\x00' * (need - 8)
+        # Replace or insert free atom at ftyp_sz
+        if data[ftyp_sz:ftyp_sz + 8] == b'\x00\x00\x00\x08free':
+            data = data[:ftyp_sz] + new_free + data[ftyp_sz + 8:]
+            shift = need - 8
+        else:
+            data = data[:ftyp_sz] + new_free + data[ftyp_sz:]
+            shift = need
+        _adjust_stco(data, shift, moov_off_p + shift + 8, moov_off_p + shift + 8 + moov_sz_p)
+        if log_func:
+            log_func(f"[FREE] inserted {need} byte free, shift={shift}")
+    else:
+        if log_func:
+            log_func(f"[FREE] skip (need={need} < 8)")
+
+    # ── Fake trailer atom ────────────────────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 11/7  Fake Trailer Atom ────────────────────────────────────")
+    data += b'\x00\x00\x00\x04xxxx'
+    if log_func:
+        log_func("[TRAILER] appended xxxx atom (size=4)")
 
     # Restore original audio duration
     if original_audio_dur is not None:
