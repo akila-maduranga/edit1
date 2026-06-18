@@ -269,9 +269,9 @@ def fingerprint_tkhd(data):
     return bytes(p)
 
 
-# ── Frame Density Inflation (5x, 8-byte dummy samples, EOF padding) ────
+# ── Frame Density Inflation (5x, valid H.264 filler NALs at EOF) ───────
 
-DUMMY_SAMPLE_SIZE = 8
+FILLER_NAL = b'\x00\x00\x00\x01\x0c\x00\x00\x80'  # 8-byte H.264 filler (ignored by decoder)
 
 def inflate_sample_table_video(data, multiplier=5):
     moov_off, moov_sz = _find_box(data, b"moov")
@@ -315,14 +315,12 @@ def inflate_sample_table_video(data, multiplier=5):
     # Read original sample count from stts (support multiple entries)
     stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
     real_count = 0
-    last_delta = 0
     stts_entries = []
     for i in range(stts_entry_count):
         off = stts_off + 16 + i * 8
         cnt = int.from_bytes(data[off:off+4], 'big')
         delta = int.from_bytes(data[off+4:off+8], 'big')
         real_count += cnt
-        last_delta = delta
         stts_entries.append((cnt, delta))
     if real_count == 0:
         return None
@@ -331,17 +329,17 @@ def inflate_sample_table_video(data, multiplier=5):
     total_count = real_count * multiplier
     fake_count = total_count - real_count
 
-    # Build stts: original entries + 1 extra for fake frames
-    new_stts_body = struct.pack('>II', 0, stts_entry_count + 1)  # version/flags + entry_count
+    # Build stts: original entries + 1 extra for fake frames (duration=1)
+    new_stts_body = struct.pack('>II', 0, stts_entry_count + 1)
     for cnt, delta in stts_entries:
         new_stts_body += struct.pack('>II', cnt, delta)
-    new_stts_body += struct.pack('>II', fake_count, last_delta)
+    new_stts_body += struct.pack('>II', fake_count, 1)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-    # Build stsz: all entries (real sizes + 8-byte dummy)
-    uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')  # uniform_size at offset+12
+    # Build stsz: all entries (real sizes + 8-byte filler)
+    uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
     new_stsz_body = bytearray(20 + total_count * 4)
-    struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)  # version/flags=0, uniform_size=0, count=total
+    struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     real_sizes_off = stsz_off + 20
     for i in range(real_count):
         if uniform_size != 0:
@@ -350,16 +348,15 @@ def inflate_sample_table_video(data, multiplier=5):
             val = int.from_bytes(data[real_sizes_off+i*4:real_sizes_off+i*4+4], 'big')
         struct.pack_into('>I', new_stsz_body, 12 + i*4, val)
     for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, DUMMY_SAMPLE_SIZE)
+        struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, len(FILLER_NAL))
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
-    # We'll compute stco delta and safe offset later
-    # First compute deltas without stco to know total moov delta
+    # Compute deltas
     stts_delta = len(new_stts) - stts_sz
     stsz_delta = len(new_stsz) - stsz_sz
-    stco_delta = fake_count * 4  # each new chunk gets a 4-byte entry
-    stsc_delta = 12  # +1 entry (12 bytes)
-    pre_stco_moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
+    stco_delta = fake_count * 4
+    stsc_delta = 12
+    moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
 
     new_stco_count = orig_stco_count + fake_count
 
@@ -377,10 +374,9 @@ def inflate_sample_table_video(data, multiplier=5):
     struct.pack_into('>III', new_stsc_body, 8 + stsc_entry_count*12, extra_first_chunk, 1, 1)
     new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
 
-    moov_delta = pre_stco_moov_delta
-    # Rebuild stco — offsets as raw original values; _adjust_stco at end adds moov_delta to all stco entries
+    # Rebuild stco — offsets as raw original values; _adjust_stco at end adds moov_delta
     stco_base = stco_off + 16
-    safe_offset = len(data)  # first EOF padding byte; _adjust_stco will add moov_delta
+    safe_offset = len(data)  # points to EOF filler NALs; _adjust_stco will add moov_delta
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     for i in range(orig_stco_count):
@@ -399,8 +395,8 @@ def inflate_sample_table_video(data, multiplier=5):
     ]
     replacements.sort(key=lambda x: x[0])
 
-    padding_size = fake_count * DUMMY_SAMPLE_SIZE
-    new_size = len(data) + moov_delta + padding_size
+    filler_total = fake_count * len(FILLER_NAL)
+    new_size = len(data) + moov_delta + filler_total
     result = bytearray(new_size)
 
     read_pos = 0
@@ -419,12 +415,12 @@ def inflate_sample_table_video(data, multiplier=5):
         old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
         struct.pack_into('>I', result, container_off, old_sz + moov_delta)
 
-    # Adjust non-video stco entries
+    # Adjust all stco entries for the moov delta
     new_moov_end = moov_off + moov_sz + moov_delta
     _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-    # Write EOF padding for dummy samples
-    result[write_pos:write_pos + padding_size] = b'\x00' * padding_size
+    # Write valid H.264 filler NALs at EOF
+    result[write_pos:write_pos + filler_total] = FILLER_NAL * fake_count
 
     return bytes(result)
 
