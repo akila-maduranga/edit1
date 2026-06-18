@@ -8,7 +8,7 @@ Pipeline:
    3. mvhd Fingerprint (next_track_id = 9999, fixed creation date)
    4. Udta Strip (remove ffmpeg encoder signature)
    5. Tkhd Fingerprint (identity matrix + alternate_group)
-   6. Frame Density Inflation (5x, 8-byte dummy samples, EOF padding)
+   6. Frame Count Inflation (5x, stsz-only, zero playback footprint)
    7. Comment Udta Injection (Apple iTunes-style only)
    8. Restore original audio duration
 """
@@ -269,9 +269,13 @@ def fingerprint_tkhd(data):
     return bytes(p)
 
 
-# ── Frame Density Inflation (5x, 0-duration frames, zero-data footprint) ─
+# ── Frame Count Inflation (stsz only, zero playback footprint) ─────────
 
 def inflate_sample_table_video(data, multiplier=5):
+    """Inflate stsz sample count only. Stts/stco/stsc untouched.
+    Encoder sees 5x frames in stsz → skips re-encode.
+    Player uses original stts timeline → video ends at normal time.
+    """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
@@ -302,128 +306,69 @@ def inflate_sample_table_video(data, multiplier=5):
     stbl_off, stbl_sz, trak_off, mdia_off, minf_off = video_stbl
     stbl_end = stbl_off + stbl_sz
 
-    stts_off, stts_sz = _find_box(data, b"stts", stbl_off+8, stbl_end)
     stsz_off, stsz_sz = _find_box(data, b"stsz", stbl_off+8, stbl_end)
-    stco_off, stco_sz = _find_box(data, b"stco", stbl_off+8, stbl_end)
-    stsc_off, stsc_sz = _find_box(data, b"stsc", stbl_off+8, stbl_end)
-
-    if -1 in (stts_off, stsz_off, stco_off, stsc_off):
-        return None
-
-    # Read original sample count from stts
-    stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
-    real_count = 0
-    stts_entries = []
-    for i in range(stts_entry_count):
-        off = stts_off + 16 + i * 8
-        cnt = int.from_bytes(data[off:off+4], 'big')
-        delta = int.from_bytes(data[off+4:off+8], 'big')
-        real_count += cnt
-        stts_entries.append((cnt, delta))
-    if real_count == 0:
+    if stsz_off == -1:
         return None
 
     # Read stsz
     uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
+    orig_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
+    new_count = orig_count * multiplier
+    diff = new_count - orig_count
+    if diff <= 0:
+        return data
 
-    # Read last real frame size & chunk offset
+    # Build new stsz atom
     if uniform_size != 0:
-        last_real_size = uniform_size
+        # Switch to non-uniform: add individual entries for all samples
+        body_size = 12 + new_count * 4  # version(4) + uniform(4) + count(4) + entries
+        new_body = bytearray(body_size)
+        struct.pack_into('>III', new_body, 0, 0, 0, new_count)  # version=0, uniform=0, count=new
+        for i in range(orig_count):
+            struct.pack_into('>I', new_body, 12 + i*4, uniform_size)
     else:
-        last_real_size = int.from_bytes(data[stsz_off+20+(real_count-1)*4:stsz_off+20+real_count*4], 'big')
+        # Append entries for fake frames (size=0 — no data)
+        body_size = 12 + new_count * 4
+        new_body = bytearray(body_size)
+        struct.pack_into('>III', new_body, 0, 0, 0, new_count)
+        src_start = stsz_off + 20
+        old_entries_len = orig_count * 4
+        new_body[12:12+old_entries_len] = data[src_start:src_start+old_entries_len]
 
-    stco_base = stco_off + 16
-    orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
-    last_real_chunk = int.from_bytes(data[stco_base+(orig_stco_count-1)*4:stco_base+orig_stco_count*4], 'big')
-
-    total_count = real_count * multiplier
-    fake_count = total_count - real_count
-
-    # Build stts: original entries + 1 extra for fake frames (0 duration)
-    new_stts_body = struct.pack('>II', 0, stts_entry_count + 1)
-    for cnt, delta in stts_entries:
-        new_stts_body += struct.pack('>II', cnt, delta)
-    new_stts_body += struct.pack('>II', fake_count, 0)
-    new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
-
-    # Build stsz: all entries (real sizes + last_real_size for each fake frame)
-    new_stsz_body = bytearray(20 + total_count * 4)
-    struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
-    real_sizes_off = stsz_off + 20
-    for i in range(real_count):
-        if uniform_size != 0:
-            val = uniform_size
-        else:
-            val = int.from_bytes(data[real_sizes_off+i*4:real_sizes_off+i*4+4], 'big')
-        struct.pack_into('>I', new_stsz_body, 12 + i*4, val)
-    for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, last_real_size)
-    new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
-
-    # Compute deltas
-    stts_delta = len(new_stts) - stts_sz
+    new_stsz = struct.pack('>I4s', 8 + body_size, b'stsz') + bytes(new_body)
     stsz_delta = len(new_stsz) - stsz_sz
-    stco_delta = fake_count * 4
-    stsc_delta = 12
-    moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
+    if stsz_delta == 0:
+        return data
 
-    new_stco_count = orig_stco_count + fake_count
-
-    # Build stsc: original entries + 1 extra for fake chunks
-    stsc_entry_count = int.from_bytes(data[stsc_off+12:stsc_off+16], 'big')
-    new_stsc_entry_count = stsc_entry_count + 1
-    new_stsc_body = bytearray(8 + new_stsc_entry_count * 12)
-    struct.pack_into('>II', new_stsc_body, 0, 0, new_stsc_entry_count)
-    base = stsc_off + 16
-    for i in range(stsc_entry_count):
-        for j in range(3):
-            val = int.from_bytes(data[base+i*12+j*4:base+i*12+j*4+4], 'big')
-            struct.pack_into('>I', new_stsc_body, 8 + i*12 + j*4, val)
-    extra_first_chunk = orig_stco_count + 1
-    struct.pack_into('>III', new_stsc_body, 8 + stsc_entry_count*12, extra_first_chunk, 1, 1)
-    new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
-
-    # Rebuild stco — original values + fake entries pointing to last real chunk
-    new_stco_body2 = bytearray(8 + new_stco_count * 4)
-    struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
-    for i in range(orig_stco_count):
-        val = int.from_bytes(data[stco_base+i*4:stco_base+i*4+4], 'big')
-        struct.pack_into('>I', new_stco_body2, 8 + i*4, val)
-    for i in range(fake_count):
-        struct.pack_into('>I', new_stco_body2, 8 + orig_stco_count*4 + i*4, last_real_chunk)
-    new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
-
-    # Replace atoms
-    replacements = [
-        (stts_off, stts_sz, new_stts),
-        (stsz_off, stsz_sz, new_stsz),
-        (stsc_off, stsc_sz, new_stsc),
-        (stco_off, stco_sz, new_stco2),
-    ]
-    replacements.sort(key=lambda x: x[0])
-
-    new_size = len(data) + moov_delta
-    result = bytearray(new_size)
-
-    read_pos = 0
-    write_pos = 0
-    for off, old_sz, new_bytes in replacements:
-        result[write_pos:write_pos + off - read_pos] = data[read_pos:off]
-        write_pos += off - read_pos
-        result[write_pos:write_pos + len(new_bytes)] = new_bytes
-        write_pos += len(new_bytes)
-        read_pos = off + old_sz
-    result[write_pos:write_pos + len(data) - read_pos] = data[read_pos:]
-    write_pos += len(data) - read_pos
+    # Replace stsz only — stts/stco/stsc stay unchanged
+    result = bytearray(len(data) + stsz_delta)
+    # Copy everything before stsz
+    result[0:stsz_off] = data[:stsz_off]
+    # Insert new stsz
+    result[stsz_off:stsz_off + len(new_stsz)] = new_stsz
+    # Copy everything after stsz (shifted by stsz_delta)
+    result[stsz_off + len(new_stsz):] = data[stsz_off + stsz_sz:]
 
     # Update container sizes
-    for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
-        old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
-        struct.pack_into('>I', result, container_off, old_sz + moov_delta)
+    # stbl
+    old = int.from_bytes(result[stbl_off:stbl_off+4], 'big')
+    struct.pack_into('>I', result, stbl_off, old + stsz_delta)
+    # minf
+    old = int.from_bytes(result[minf_off:minf_off+4], 'big')
+    struct.pack_into('>I', result, minf_off, old + stsz_delta)
+    # mdia
+    old = int.from_bytes(result[mdia_off:mdia_off+4], 'big')
+    struct.pack_into('>I', result, mdia_off, old + stsz_delta)
+    # trak
+    old = int.from_bytes(result[trak_off:trak_off+4], 'big')
+    struct.pack_into('>I', result, trak_off, old + stsz_delta)
+    # moov
+    old = int.from_bytes(result[moov_off:moov_off+4], 'big')
+    struct.pack_into('>I', result, moov_off, old + stsz_delta)
 
     # Adjust all stco entries for the moov delta
-    new_moov_end = moov_off + moov_sz + moov_delta
-    _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
+    new_moov_sz = moov_sz + stsz_delta
+    _adjust_stco(result, stsz_delta, moov_off+8, moov_off+8+new_moov_sz)
 
     return bytes(result)
 
@@ -637,10 +582,10 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func("[TKHD] done")
 
-    # ── Pass 6: Frame Density Inflation (5x, 8-byte dummy, EOF padding) ──
+    # ── Pass 6: Frame Count Inflation (stsz-only) ──────────────────────────
     if log_func:
         log_func("")
-        log_func("── 6/7  Frame Density Inflation (5x) ───────────────────────")
+        log_func("── 6/7  Frame Count Inflation (stsz-only, 5x) ─────────────")
     inflated = inflate_sample_table_video(data, multiplier=5)
     if inflated is None:
         if log_func:
