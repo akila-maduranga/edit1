@@ -181,9 +181,7 @@ def rebuild_elst_bypass(data):
 # ── Subtle mvhd fingerprint ─────────────────────────────────────────
 
 def patch_mvhd_fingerprint(data):
-    """Change mvhd.next_track_id to a large value + set a fixed creation time.
-    Alters the file's hash/signature without introducing suspicious matrix values.
-    """
+    """Change mvhd timestamps and next_track_id using minimal, plausible values."""
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
@@ -194,18 +192,16 @@ def patch_mvhd_fingerprint(data):
     version = p[mvhd_off+8]
     if version == 0:
         ct_off = mvhd_off + 12
-        dur_off = mvhd_off + 24
         nti_off = mvhd_off + 84
     else:
         ct_off = mvhd_off + 20
-        dur_off = mvhd_off + 32
         nti_off = mvhd_off + 96
-    rand_ts = random.randint(1_600_000_000, 1_750_000_000)
+    fixed_ts = 1_700_000_000  # Nov 2023 — plausible
     if ct_off + 8 <= len(p):
-        struct.pack_into('>II', p, ct_off, rand_ts, rand_ts)
-    rand_nti = random.randint(100, 9998)
+        struct.pack_into('>II', p, ct_off, fixed_ts, fixed_ts)
     if nti_off + 4 <= len(p):
-        struct.pack_into('>I', p, nti_off, rand_nti)
+        orig_nti = int.from_bytes(p[nti_off:nti_off+4], 'big')
+        struct.pack_into('>I', p, nti_off, orig_nti + 1)
     return bytes(p)
 
 
@@ -243,9 +239,9 @@ def fingerprint_tkhd(data):
             continue
         version = p[tkhd_off+8]
         if version == 0:
-            group_off = tkhd_off + 8 + 32
+            group_off = tkhd_off + 8 + 34  # alternate_group for v0
         elif version == 1:
-            group_off = tkhd_off + 8 + 44
+            group_off = tkhd_off + 8 + 46  # alternate_group for v1
         else:
             continue
         if group_off + 2 <= len(p):
@@ -896,9 +892,10 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
             log_func("")
             log_func("── 6/7  Brand + Bitrate Spoofing ────────────────────────────")
         data = patch_ftyp(data)
-        data = patch_stsd_bitrate(data, 100_000_000)
+        if not brand_spoof_only:
+            data = patch_stsd_bitrate(data, 50_000_000)
         if log_func:
-            log_func("[SPOOF] M4VH brand + 100Mbps bitrate")
+            log_func("[SPOOF] M4VH brand" + (" + 50Mbps" if not brand_spoof_only else ""))
     
     # ── Pass 7: Comment Udta Injection ───────────────────────────────────
     if log_func:
