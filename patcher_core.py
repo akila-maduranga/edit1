@@ -519,7 +519,7 @@ def inflate_sample_table_video(data, multiplier=5):
     # Clip container durations to real video duration (prevent freeze display)
     real_sec = total_ticks / 90000.0
     mvhd_dur = int(real_sec * 1000)  # fallback
-    mvhd_off = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
+    mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
     if mvhd_off != -1:
         ver = result[mvhd_off+12]
         if ver == 0:
