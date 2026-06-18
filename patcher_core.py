@@ -336,20 +336,16 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
     return result
 
 def inflate_sample_table_video(data, multiplier=5, original_size=None):
-    """5x inflation: non-interleaved, two-entry stts + filler NALs at end.
-    Real frames at original delta, filler at delta=750.
-    Container durations clipped to real duration.
-    Unique stco entries — no compression.
-    Auto-pads file to match expected size for inflated bitrate.
+    """NoBlur-style inflation: 8-byte dummy samples at a single offset.
+    No valid NAL content needed. TikTok re-encodes anyway.
     """
-    data = _patch_avcC_sps(data)
-
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
+    moov_end = moov_off + moov_sz
 
     video_stbl = None
-    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_end):
         mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
         if mdia_off == -1:
             continue
@@ -381,175 +377,153 @@ def inflate_sample_table_video(data, multiplier=5, original_size=None):
     if -1 in (stts_off, stsz_off, stco_off, stsc_off):
         return None
 
+    # Read original stts
     stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
     real_count = 0
-    last_delta = 0
-    total_ticks = 0
+    total_duration = 0
     for i in range(stts_entry_count):
         off = stts_off + 16 + i * 8
         cnt = int.from_bytes(data[off:off+4], 'big')
         delta = int.from_bytes(data[off+4:off+8], 'big')
         real_count += cnt
-        last_delta = delta
-        total_ticks += cnt * delta
+        total_duration += cnt * delta
     if real_count == 0:
         return None
 
-    orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
-    total_count = real_count * multiplier
-    fake_count = total_count - real_count
-    fake_delta = 750
+    sample_delta = round(total_duration / real_count)
+    fake_count = real_count * (multiplier - 1)
+    total_count = real_count + fake_count
+    orig_chunk_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
 
-    # Two-entry stts
-    new_stts_body = struct.pack('>II', 0, 2)
-    new_stts_body += struct.pack('>II', real_count, last_delta)
-    new_stts_body += struct.pack('>II', fake_count, fake_delta)
-    new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
+    # Detect codec for dummy size (NoBlur: 8B for avc1/avc3)
+    stsd_off, _ = _find_box(data, b"stsd", stbl_off+8, stbl_end)
+    codec = b'avc1'
+    if stsd_off != -1 and stsd_off+20 <= len(data):
+        codec = data[stsd_off+16:stsd_off+20]
+    dummy_size = {b'avc1': 8, b'avc3': 8, b'hvc1': 16, b'hev1': 16, b'vp09': 4, b'av01': 4}.get(codec, 8)
 
-    # Find mdat for filler NAL data
-    mdat_off, mdat_sz = _find_box(data, b"mdat")
-    if mdat_off == -1:
-        return None
-
-    # Read real frame sizes
-    orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
-    uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
+    # Read real sizes from stsz
+    uniform = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
     real_sizes = []
     for i in range(real_count):
-        if uniform_size != 0:
-            real_sizes.append(uniform_size)
-        elif i < orig_stsz_count:
-            real_sizes.append(int.from_bytes(data[stsz_off+20+i*4:stsz_off+24+i*4], 'big'))
+        if uniform != 0:
+            real_sizes.append(uniform)
         else:
-            real_sizes.append(uniform_size if uniform_size else 0)
+            real_sizes.append(int.from_bytes(data[stsz_off+20+i*4:stsz_off+24+i*4], 'big'))
 
-    real_offsets = _sample_offsets(data, stco_off, stsc_off, stsz_off, real_count)
-    if not real_offsets:
-        return None
+    # Build new stts: preserve original entries + 1 filler entry
+    new_stts_body = struct.pack('>II', 0, stts_entry_count + 1)
+    for i in range(stts_entry_count):
+        off = stts_off + 16 + i * 8
+        cnt = int.from_bytes(data[off:off+4], 'big')
+        delta = int.from_bytes(data[off+4:off+8], 'big')
+        new_stts_body += struct.pack('>II', cnt, delta)
+    new_stts_body += struct.pack('>II', fake_count, sample_delta)
+    new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + bytes(new_stts_body)
 
-    # Read real frame data from mdat for filler cycling
-    real_frame_data = []
-    for off, sz in real_offsets:
-        real_frame_data.append(data[off:off+sz])
-
-    # Build filler data: cycle real frames, append 0x80 to each
-    # filler frame to vary hash without affecting decoded output
-    # (trailing stop bit is ignored by decoders)
-    filler_data = bytearray()
-    filler_sizes = []
-    for i in range(fake_count):
-        src = real_frame_data[i % real_count]
-        filler_data += src + b'\x80'
-        filler_sizes.append(len(src) + 1)
-
-    # Non-interleaved stsz: all real, then all filler
+    # Build new stsz: real + all dummy
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     for i in range(real_count):
         struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
     for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, filler_sizes[i])
+        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, dummy_size)
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
-    # stsc: all chunks have 1 sample
-    new_stsc_body = struct.pack('>II', 0, 1)
-    new_stsc_body += struct.pack('>III', 1, 1, 1)
+    # Build stsc: original entries + new entry for fake chunks (1 spc)
+    stsc_entry_count = int.from_bytes(data[stsc_off+12:stsc_off+16], 'big')
+    new_stsc_body = bytearray(16 + (stsc_entry_count + 1) * 12)
+    struct.pack_into('>II', new_stsc_body, 0, 0, stsc_entry_count + 1)
+    for i in range(stsc_entry_count):
+        off = stsc_off + 16 + i * 12
+        struct.pack_into('>III', new_stsc_body, 8 + i * 12,
+                         int.from_bytes(data[off:off+4], 'big'),
+                         int.from_bytes(data[off+4:off+8], 'big'),
+                         int.from_bytes(data[off+8:off+12], 'big'))
+    struct.pack_into('>III', new_stsc_body, 8 + stsc_entry_count * 12,
+                     orig_chunk_count + 1, 1, 1)
     new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
 
-    new_stco_count = total_count
+    # Calculate deltas
     stts_delta = len(new_stts) - stts_sz
     stsz_delta = len(new_stsz) - stsz_sz
-    stco_delta = (new_stco_count - orig_stco_count) * 4
     stsc_delta = len(new_stsc) - stsc_sz
+    stco_delta = fake_count * 4
     moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
 
-    # Non-interleaved stco: all real offsets, then all filler offsets
-    new_stco_body2 = bytearray(8 + new_stco_count * 4)
-    struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
-    for i in range(real_count):
-        struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
-    for i in range(fake_count):
-        pos = mdat_off + mdat_sz + sum(filler_sizes[:i])
-        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
-    new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
+    # Safe offset = file size + moov_delta (start of EOF padding)
+    safe_offset = len(data) + moov_delta
 
+    # Build new stco: original offsets (shifted) + all fake at safe_offset
+    new_stco_body = bytearray(8 + (orig_chunk_count + fake_count) * 4)
+    struct.pack_into('>II', new_stco_body, 0, 0, orig_chunk_count + fake_count)
+    for i in range(orig_chunk_count):
+        off = int.from_bytes(data[stco_off+16+i*4:stco_off+20+i*4], 'big')
+        struct.pack_into('>I', new_stco_body, 8 + i * 4, off + moov_delta)
+    for i in range(fake_count):
+        struct.pack_into('>I', new_stco_body, 8 + (orig_chunk_count + i) * 4, safe_offset)
+    new_stco = struct.pack('>I4s', 8 + len(new_stco_body), b'stco') + bytes(new_stco_body)
+
+    # Replace boxes in stbl
     replacements = [
         (stts_off, stts_sz, new_stts),
         (stsz_off, stsz_sz, new_stsz),
         (stsc_off, stsc_sz, new_stsc),
-        (stco_off, stco_sz, new_stco2),
+        (stco_off, stco_sz, new_stco),
     ]
     replacements.sort(key=lambda x: x[0])
 
-    new_size = len(data) + moov_delta
-    result = bytearray(new_size)
+    padding_sz = fake_count * dummy_size
+    new_sz = len(data) + moov_delta + padding_sz
+    result = bytearray(new_sz)
 
     read_pos = 0
     write_pos = 0
     for off, old_sz, new_bytes in replacements:
-        result[write_pos:write_pos + off - read_pos] = data[read_pos:off]
-        write_pos += off - read_pos
+        chunk = data[read_pos:off]
+        result[write_pos:write_pos + len(chunk)] = chunk
+        write_pos += len(chunk)
         result[write_pos:write_pos + len(new_bytes)] = new_bytes
         write_pos += len(new_bytes)
         read_pos = off + old_sz
-    result[write_pos:write_pos + len(data) - read_pos] = data[read_pos:]
-    write_pos += len(data) - read_pos
+    if read_pos < len(data):
+        rest = data[read_pos:]
+        result[write_pos:write_pos + len(rest)] = rest
 
-    for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
-        old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
-        struct.pack_into('>I', result, container_off, old_sz + moov_delta)
+    # Update container sizes
+    for c_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
+        old = int.from_bytes(result[c_off:c_off+4], 'big')
+        struct.pack_into('>I', result, c_off, old + moov_delta)
 
-    new_moov_end = moov_off + moov_sz + moov_delta
-    _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
-
-    # Extend mdat with filler NALs and update mdat header
-    result.extend(filler_data)
-    struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + len(filler_data))
-
-    # Clip container durations to real video duration
-    real_sec = total_ticks / 90000.0
-    mvhd_dur = int(real_sec * 1000)
-    mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
-    if mvhd_off != -1:
-        ver = result[mvhd_off+12]
-        if ver == 0:
-            mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
-            mvhd_dur = int(real_sec * mvhd_ts)
-            result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
-        else:
-            mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
-            mvhd_dur = int(real_sec * mvhd_ts)
-            result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
-
-    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
-        tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
-        if tkhd_off != -1:
-            ver = result[tkhd_off+12]
-            if ver == 0:
-                result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', mvhd_dur)
-            else:
-                result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', mvhd_dur)
-
-        mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off == -1:
+    # Update all trak stco/co64 with moov_delta (audio track, etc.)
+    new_moov_end = moov_off + int.from_bytes(result[moov_off:moov_off+4], 'big')
+    for t_off, t_sz, _ in _iter_boxes(result, moov_off+8, new_moov_end):
+        t_mdia_off, _ = _find_box(result, b"mdia", t_off+8, t_off+t_sz)
+        if t_mdia_off == -1:
             continue
-        hdlr_off, _ = _find_box(result, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1:
+        t_minf_off, _ = _find_box(result, b"minf", t_mdia_off+8,
+                                  t_mdia_off + int.from_bytes(result[t_mdia_off:t_mdia_off+4], 'big'))
+        if t_minf_off == -1:
             continue
-        mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
-        if mdhd_off == -1:
+        t_stbl_off, _ = _find_box(result, b"stbl", t_minf_off+8,
+                                  t_minf_off + int.from_bytes(result[t_minf_off:t_minf_off+4], 'big'))
+        if t_stbl_off == -1:
             continue
-        is_video = result[hdlr_off+16:hdlr_off+20] == b'vide'
-        ver = result[mdhd_off+12]
-        if is_video:
-            if ver == 0:
-                mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
-                mdhd_dur = int(real_sec * mdhd_ts)
-                result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
-            else:
-                mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
-                mdhd_dur = int(real_sec * mdhd_ts)
-                result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
+        t_stbl_end = t_stbl_off + int.from_bytes(result[t_stbl_off:t_stbl_off+4], 'big')
+        t_stco_off, _ = _find_box(result, b"stco", t_stbl_off+8, t_stbl_end)
+        if t_stco_off != -1:
+            cnt = int.from_bytes(result[t_stco_off+12:t_stco_off+16], 'big')
+            for i in range(cnt):
+                pos = t_stco_off + 16 + i * 4
+                old = int.from_bytes(result[pos:pos+4], 'big')
+                struct.pack_into('>I', result, pos, old + moov_delta)
+        t_co64_off, _ = _find_box(result, b"co64", t_stbl_off+8, t_stbl_end)
+        if t_co64_off != -1:
+            cnt = int.from_bytes(result[t_co64_off+12:t_co64_off+16], 'big')
+            for i in range(cnt):
+                pos = t_co64_off + 16 + i * 8
+                old = int.from_bytes(result[pos:pos+8], 'big')
+                struct.pack_into('>Q', result, pos, old + moov_delta)
 
     # Auto-pad to match expected size for inflated bitrate
     if original_size is not None:
@@ -563,7 +537,7 @@ def inflate_sample_table_video(data, multiplier=5, original_size=None):
     return bytes(result)
 
 
-# ── Elst Loop (hide filler freeze) ─────────────────────────────────────
+# ── Comment Udta Injection (meta/ilst, only \xa9cmt) ───────────────────
 
 def patch_elst_loop(data, loop_count=5):
     """Replace video track's elst with a multi-entry loop covering the
@@ -947,11 +921,27 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
             log_func("")
             log_func("── 3-5/7  (skipped — minimal mode)")
 
+    # ── Pass 6: SPS/avcC spoofing (High10 + level 6.2) ──────────────
+    if log_func:
+        log_func("")
+        log_func("── 6/7  SPS/avcC Spoof (High10, 6.2) ───────────────────────────")
+    data = _patch_avcC_sps(data)
+    if log_func:
+        log_func("[AVCC] done")
+
+    # ── Pass 7: Codec avc1→avc3 ────────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 7/7  Codec avc1 → avc3 ─────────────────────────────────────")
+    data = patch_stsd_codec(data)
+    if log_func:
+        log_func("[CODEC] avc3")
+
     if use_inflation:
-        # ── Pass 6: Frame Count Inflation ────────────────────────────
+        # ── Pass 8: Frame Count Inflation ────────────────────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Frame Count Inflation (5x, non-interleaved, duration clip) ─────")
+            log_func("── 8/8  Frame Count Inflation (5x, non-interleaved, duration clip) ─────")
         inflated = inflate_sample_table_video(data, multiplier=multiplier, original_size=len(original_data))
         if inflated is None:
             if log_func:
@@ -963,20 +953,20 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         if log_func:
             log_func("[INFLATE] done")
     else:
-        # ── Pass 6: Brand + Bitrate Spoofing ───────────────────────
+        # ── Pass 8: Brand + Bitrate Spoofing ───────────────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Brand + Bitrate Spoofing ────────────────────────────")
+            log_func("── 8/8  Brand + Bitrate Spoofing ────────────────────────────")
         data = patch_ftyp(data)
         if not brand_spoof_only:
             data = patch_stsd_bitrate(data, 50_000_000)
         if log_func:
             log_func("[SPOOF] M4VH brand" + (" + 50Mbps" if not brand_spoof_only else ""))
     
-    # ── Pass 7: Comment Udta Injection ───────────────────────────────────
+    # ── Pass 9: Comment Udta Injection ───────────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 7/7  Comment Udta Injection ─────────────────────────────")
+        log_func("── 9/9  Comment Udta Injection ─────────────────────────────")
     data = inject_comment_udta(data, comment)
     if log_func:
         log_func("[COMMENT] injected")
