@@ -335,19 +335,7 @@ def inflate_sample_table_video(data, multiplier=5):
     stsc_delta = 12  # +1 entry (12 bytes)
     pre_stco_moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
 
-    safe_offset = len(data) + pre_stco_moov_delta + fake_count * DUMMY_SAMPLE_SIZE
-
-    # Build stco: original entries + fake entries pointing to safe_offset
     new_stco_count = orig_stco_count + fake_count
-    new_stco_body = bytearray(8 + new_stco_count * 4)
-    struct.pack_into('>II', new_stco_body, 0, 0, new_stco_count)
-    base = stco_off + 16
-    for i in range(orig_stco_count):
-        val = int.from_bytes(data[base+i*4:base+i*4+4], 'big')
-        struct.pack_into('>I', new_stco_body, 8 + i*4, val + pre_stco_moov_delta)
-    for i in range(fake_count):
-        struct.pack_into('>I', new_stco_body, 8 + orig_stco_count*4 + i*4, safe_offset)
-    new_stco = struct.pack('>I4s', 8 + len(new_stco_body), b'stco') + bytes(new_stco_body)
 
     # Build stsc: original entries + 1 extra for fake chunks
     stsc_entry_count = int.from_bytes(data[stsc_off+12:stsc_off+16], 'big')
@@ -364,13 +352,14 @@ def inflate_sample_table_video(data, multiplier=5):
     new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
 
     moov_delta = pre_stco_moov_delta
-    # Rebuild stco with correct safe_offset (after all moov changes + padding)
-    safe_offset = len(data) + moov_delta + fake_count * DUMMY_SAMPLE_SIZE
+    # Rebuild stco — offsets as raw original values; _adjust_stco at end adds moov_delta to all stco entries
+    stco_base = stco_off + 16
+    safe_offset = len(data)  # first EOF padding byte; _adjust_stco will add moov_delta
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     for i in range(orig_stco_count):
-        val = int.from_bytes(data[base+i*4:base+i*4+4], 'big')
-        struct.pack_into('>I', new_stco_body2, 8 + i*4, val + moov_delta)
+        val = int.from_bytes(data[stco_base+i*4:stco_base+i*4+4], 'big')
+        struct.pack_into('>I', new_stco_body2, 8 + i*4, val)
     for i in range(fake_count):
         struct.pack_into('>I', new_stco_body2, 8 + orig_stco_count*4 + i*4, safe_offset)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
