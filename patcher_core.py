@@ -381,12 +381,25 @@ def inflate_sample_table_video(data, multiplier=5):
     total_count = real_count * multiplier
     fake_count = total_count - real_count
 
-    fake_delta = 750
-    new_stts_body = struct.pack('>II', 0, stts_entry_count + 1)
-    for cnt, delta in stts_entries:
-        new_stts_body += struct.pack('>II', cnt, delta)
-    new_stts_body += struct.pack('>II', fake_count, fake_delta)
+    real_total_duration = sum(cnt * delta for cnt, delta in stts_entries)
+    new_delta = max(1, real_total_duration // total_count)
+    new_stts_body = struct.pack('>II', 0, 1)
+    new_stts_body += struct.pack('>II', total_count, new_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
+
+    # Update stss sync sample indices (1-indexed)
+    stss_off, stss_sz = _find_box(data, b"stss", stbl_off+8, stbl_end)
+    new_stss = None
+    if stss_off != -1:
+        stss_count = int.from_bytes(data[stss_off+12:stss_off+16], 'big')
+        body = bytearray(8 + stss_count * 4)
+        struct.pack_into('>II', body, 0, 0, stss_count)
+        for i in range(stss_count):
+            old_idx = int.from_bytes(data[stss_off+16+i*4:stss_off+20+i*4], 'big')
+            new_idx = (old_idx - 1) * multiplier + 1
+            struct.pack_into('>I', body, 8 + i*4, new_idx)
+        new_stss = struct.pack('>I4s', 8 + len(body), b'stss') + bytes(body)
+    stss_delta = (len(new_stss) - stss_sz) if new_stss else 0
 
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
@@ -406,7 +419,7 @@ def inflate_sample_table_video(data, multiplier=5):
     stsz_delta = len(new_stsz) - stsz_sz
     stco_delta = fake_count * 4
     stsc_delta = 12
-    moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
+    moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta + stss_delta
 
     new_stco_count = orig_stco_count + fake_count
 
@@ -440,6 +453,8 @@ def inflate_sample_table_video(data, multiplier=5):
         (stsc_off, stsc_sz, new_stsc),
         (stco_off, stco_sz, new_stco2),
     ]
+    if new_stss is not None:
+        replacements.append((stss_off, stss_sz, new_stss))
     replacements.sort(key=lambda x: x[0])
 
     filler_total = fake_count * len(FILLER_NAL)
@@ -681,7 +696,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ── Pass 6: Frame Count Inflation (avcC bump + single-entry stts) ─────────
     if log_func:
         log_func("")
-        log_func("── 6/7  Frame Count Inflation (avcC/SPS patch, delta=750) ─────")
+        log_func("── 6/7  Frame Count Inflation (single-entry, avcC/SPS, stss) ───")
     inflated = inflate_sample_table_video(data, multiplier=5)
     if inflated is None:
         if log_func:
