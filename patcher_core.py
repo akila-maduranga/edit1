@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Core patching engine — implements NoBlur-style 7-pass TikTok bypass.
+Core patching engine — TikTok bypass with fingerprint-based re-encode prevention.
 
 Pipeline:
-  1. FFmpeg remux (Faststart, normalize)
-  2. ZeroLoss Track Bypass (edts/elst rebuild)
-  3. Quantum Matrix Patch (mvhd display matrix)
-  4. Udta Strip (remove ffmpeg encoder signature)
-  5. Tkhd Matrix Reset (identity matrix)
-  6. Frame Density Inflation (5x, 8-byte dummy samples, EOF padding)
-  7. Comment Udta Injection (Apple iTunes-style only)
+   1. FFmpeg remux (Faststart, normalize)
+   2. ZeroLoss Track Bypass (edts/elst rebuild)
+   3. mvhd Fingerprint (next_track_id = 9999, fixed creation date)
+   4. Udta Strip (remove ffmpeg encoder signature)
+   5. Tkhd Fingerprint (identity matrix + alternate_group)
+   6. Frame Density Inflation (5x, 8-byte dummy samples, EOF padding)
+   7. Comment Udta Injection (Apple iTunes-style only)
+   8. Restore original audio duration
 """
 
 import struct
@@ -177,29 +178,35 @@ def rebuild_elst_bypass(data):
     return bytes(new_data)
 
 
-# ── Quantum Matrix Patch (mvhd display matrix) ─────────────────────────
+# ── Subtle mvhd fingerprint ─────────────────────────────────────────
 
-def patch_mvhd_matrix(data):
+def patch_mvhd_fingerprint(data):
+    """Change mvhd.next_track_id to a large value + set a fixed creation time.
+    Alters the file's hash/signature without introducing suspicious matrix values.
+    """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
     mvhd_off, _ = _find_box(data, b"mvhd", moov_off+8, moov_off+moov_sz)
     if mvhd_off == -1:
         return data
-    version = data[mvhd_off+8]
-    if version == 0:
-        matrix_off = mvhd_off + 8 + 36
-    elif version == 1:
-        matrix_off = mvhd_off + 8 + 48
-    else:
-        return data
-    if matrix_off + 8 > len(data):
-        return data
     p = bytearray(data)
-    b_off = matrix_off + 4
-    prev = int.from_bytes(p[b_off:b_off+4], 'big', signed=True)
-    if prev == 0:
-        struct.pack_into('>i', p, b_off, 1)
+    version = p[mvhd_off+8]
+    if version == 0:
+        ct_off = mvhd_off + 12
+        dur_off = mvhd_off + 24
+        nti_off = mvhd_off + 84
+    else:
+        ct_off = mvhd_off + 20
+        dur_off = mvhd_off + 32
+        nti_off = mvhd_off + 96
+    # Set creation/modification time to a fixed point (Jan 1 2020)
+    fixed_ts = 1577836800
+    if ct_off + 8 <= len(p):
+        struct.pack_into('>II', p, ct_off, fixed_ts, fixed_ts)
+    # Set next_track_id to a large value to signal "already processed"
+    if nti_off + 4 <= len(p):
+        struct.pack_into('>I', p, nti_off, 9999)
     return bytes(p)
 
 
@@ -220,13 +227,17 @@ def strip_udta(data):
     return bytes(data)
 
 
-# ── Tkhd Matrix Reset ──────────────────────────────────────────────────
+# ── Tkhd fingerprint ──────────────────────────────────────────────────
 
-def reset_tkhd_matrices(data):
+def fingerprint_tkhd(data):
+    """Keep tkhd matrix at identity, but set alternate_group so the
+    track-level digest differs from an unmodified file.
+    """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
     p = bytearray(data)
+    group_id = 1
     for trak_off, trak_sz, _ in _iter_boxes(p, moov_off+8, moov_off+moov_sz):
         tkhd_off, _ = _find_box(p, b"tkhd", trak_off+8, trak_off+trak_sz)
         if tkhd_off == -1:
@@ -234,21 +245,27 @@ def reset_tkhd_matrices(data):
         version = p[tkhd_off+8]
         if version == 0:
             matrix_off = tkhd_off + 8 + 40
+            group_off = tkhd_off + 8 + 32
         elif version == 1:
             matrix_off = tkhd_off + 8 + 52
+            group_off = tkhd_off + 8 + 44
         else:
             continue
-        if matrix_off + 36 > len(p):
-            continue
-        struct.pack_into('>I', p, matrix_off, 0x00010000)
-        struct.pack_into('>I', p, matrix_off+4, 0)
-        struct.pack_into('>I', p, matrix_off+8, 0)
-        struct.pack_into('>I', p, matrix_off+12, 0)
-        struct.pack_into('>I', p, matrix_off+16, 0x00010000)
-        struct.pack_into('>I', p, matrix_off+20, 0)
-        struct.pack_into('>I', p, matrix_off+24, 0)
-        struct.pack_into('>I', p, matrix_off+28, 0)
-        struct.pack_into('>I', p, matrix_off+32, 0x40000000)
+        # Set matrix to identity (standard)
+        if matrix_off + 36 <= len(p):
+            struct.pack_into('>I', p, matrix_off, 0x00010000)
+            struct.pack_into('>I', p, matrix_off+4, 0)
+            struct.pack_into('>I', p, matrix_off+8, 0)
+            struct.pack_into('>I', p, matrix_off+12, 0)
+            struct.pack_into('>I', p, matrix_off+16, 0x00010000)
+            struct.pack_into('>I', p, matrix_off+20, 0)
+            struct.pack_into('>I', p, matrix_off+24, 0)
+            struct.pack_into('>I', p, matrix_off+28, 0)
+            struct.pack_into('>I', p, matrix_off+32, 0x40000000)
+        # Set alternate_group to a non-zero value (track-level fingerprint)
+        if group_off + 2 <= len(p):
+            struct.pack_into('>H', p, group_off, group_id)
+            group_id += 1
     return bytes(p)
 
 
@@ -595,11 +612,11 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func("[ELST] done")
 
-    # ── Pass 3: Quantum Matrix Patch (mvhd matrix) ──────────────────────
+    # ── Pass 3: Subtle mvhd fingerprint ──────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 3/7  Quantum Matrix Patch (mvhd) ───────────────────────")
-    data = patch_mvhd_matrix(data)
+        log_func("── 3/7  mvhd Fingerprint (next_track_id + date) ───────────")
+    data = patch_mvhd_fingerprint(data)
     if log_func:
         log_func("[MVHD] done")
 
@@ -613,11 +630,11 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func(f"[UDTA] stripped {stripped} bytes" if stripped else "[UDTA] none found")
 
-    # ── Pass 5: Tkhd Matrix Reset ───────────────────────────────────────
+    # ── Pass 5: Tkhd fingerprint ────────────────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 5/7  Tkhd Matrix Reset ──────────────────────────────────")
-    data = reset_tkhd_matrices(data)
+        log_func("── 5/7  Tkhd Fingerprint (identity matrix + alternate_group) ──")
+    data = fingerprint_tkhd(data)
     if log_func:
         log_func("[TKHD] done")
 
