@@ -130,12 +130,6 @@ def rebuild_elst_bypass(data):
             continue
         mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
         media_time = 0
-        if mdhd_off != -1:
-            v = data[mdhd_off+8]
-            ts_off = mdhd_off + (24 if v == 0 else 32)
-            timescale = int.from_bytes(data[ts_off:ts_off+4], 'big')
-            if timescale == 90000:
-                media_time = 6000
 
         edts_bytes = build_edts_atom(duration, media_time)
         edts_off, edts_sz = _find_box(data, b"edts", trak_off+8, trak_off+trak_sz)
@@ -560,6 +554,72 @@ def inflate_sample_table_video(data, multiplier=5, original_size=None):
     return bytes(result)
 
 
+# ── Elst Loop (hide filler freeze) ─────────────────────────────────────
+
+def patch_elst_loop(data, loop_count=5):
+    """Replace video track's elst with a multi-entry loop covering the
+    real-frame portion. Filler frames in stts are ignored during display,
+    so the freeze is hidden and video appears to repeat `loop_count` times.
+    """
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+    moov_end = moov_off + moov_sz
+
+    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_end):
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
+            continue
+        stbl_off, stbl_sz = _find_box(data, b"stbl", mdia_off+8, mdia_off+mdia_sz)
+        if stbl_off == -1:
+            continue
+        stts_off, _ = _find_box(data, b"stts", stbl_off+8, stbl_off+stbl_sz)
+        if stts_off == -1:
+            continue
+        entry_cnt = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
+        if entry_cnt == 0:
+            continue
+        first_cnt = int.from_bytes(data[stts_off+16:stts_off+20], 'big')
+        first_delta = int.from_bytes(data[stts_off+20:stts_off+24], 'big')
+        real_ticks = first_cnt * first_delta
+
+        # Build 5-entry elst
+        elst_body = struct.pack('>II', 0, loop_count)
+        for _ in range(loop_count):
+            elst_body += struct.pack('>IIii', real_ticks, 0, 0x00010000)
+        elst_full = struct.pack('>I4s', 12 + len(elst_body), b'elst') + bytes(elst_body)
+        edts_new = struct.pack('>I4s', 8 + len(elst_full), b'edts') + elst_full
+
+        edts_off, edts_sz = _find_box(data, b"edts", trak_off+8, trak_off+trak_sz)
+        edts_old = data[edts_off:edts_off+edts_sz] if edts_off != -1 else b''
+        delta = len(edts_new) - (edts_sz if edts_off != -1 else 0)
+
+        # Rebuild buffer
+        if edts_off != -1:
+            before = data[:edts_off]
+            after = data[edts_off + edts_sz:]
+        else:
+            before = data[:mdia_off]
+            after = data[mdia_off:]
+
+        result = bytearray(len(data) + delta)
+        result[:len(before)] = before
+        result[len(before):len(before)+len(edts_new)] = edts_new
+        result[len(before)+len(edts_new):] = after
+
+        # Update container sizes
+        for c_off in (trak_off, moov_off):
+            old = int.from_bytes(result[c_off:c_off+4], 'big')
+            struct.pack_into('>I', result, c_off, old + delta)
+        new_moov_sz = moov_sz + delta
+        _adjust_stco(result, delta, moov_off+8, moov_off+8+new_moov_sz)
+        return bytes(result)
+    return data
+
+
 # ── Comment Udta Injection (meta/ilst, only \xa9cmt) ───────────────────
 
 def build_comment_udta(comment):
@@ -834,18 +894,13 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         log_func(f"[READ] {len(data):,} bytes")
         _dump_atoms(data, "REBASE", log_func)
 
-    if use_inflation:
-        # ── Pass 2a: ZeroLoss Track Bypass (edts/elst) ─────────────────
-        if log_func:
-            log_func("")
-            log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
-        data = rebuild_elst_bypass(data)
-        if log_func:
-            log_func("[ELST] done")
-    else:
-        if log_func:
-            log_func("")
-            log_func("── 2/7  (skipped — no inflation mode)")
+    # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ─────────
+    if log_func:
+        log_func("")
+        log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
+    data = rebuild_elst_bypass(data)
+    if log_func:
+        log_func("[ELST] done")
 
     if not minimal:
         # ── Pass 3: Subtle mvhd fingerprint ──────────────────────────
@@ -898,6 +953,13 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         data = inflated
         if log_func:
             log_func("[INFLATE] done")
+        # Loop elst to hide filler freeze (video repeats 5x, no freeze displayed)
+        if log_func:
+            log_func("")
+            log_func("── 6b/7  Elst Loop (hide filler freeze) ──────────────────────")
+        data = patch_elst_loop(data, loop_count=5)
+        if log_func:
+            log_func("[ELST_LOOP] done")
     else:
         # ── Pass 6: Brand + Bitrate Spoofing ───────────────────────
         if log_func:
