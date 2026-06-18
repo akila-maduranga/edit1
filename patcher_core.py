@@ -358,9 +358,9 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
     return result
 
 def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation: single-entry stts + interleaved real/filler NALs + avcC/SPS patch.
-    Single entry delta=750 (120fps) — proven to pass processing.
-    Real frames and filler NALs interleaved to avoid contiguous freeze.
+    """5x inflation: two-entry stts (real frames at original delta, filler at 750).
+    Non-interleaved: all real frames first, then all filler NALs.
+    + avcC/SPS patch.
     """
     data = _patch_avcC_sps(data)
 
@@ -419,14 +419,12 @@ def inflate_sample_table_video(data, multiplier=5):
     total_count = real_count * multiplier
     fake_count = total_count - real_count
 
-    fake_per_real = multiplier - 1  # 4 filler NALs per real frame
-    fake_delta = 750  # 120fps — proven to pass processing
+    fake_delta = 1  # 90,000fps — passes processing, 3788 frames in 0.042s (no freeze)
 
-    # Interleaved stts: (1 real @ original delta, 4 filler @ 750) × 947
-    new_stts_body = struct.pack('>II', 0, real_count * 2)  # 1894 entries
-    for _ in range(real_count):
-        new_stts_body += struct.pack('>II', 1, last_delta)   # 1 real frame
-        new_stts_body += struct.pack('>II', fake_per_real, fake_delta)  # 4 filler
+    # Two-entry stts: real frames at original delta, filler at 120fps
+    new_stts_body = struct.pack('>II', 0, 2)  # 2 entries
+    new_stts_body += struct.pack('>II', real_count, last_delta)
+    new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Find mdat for fake frame data (filler NALs appended after real mdat)
@@ -454,14 +452,13 @@ def inflate_sample_table_video(data, multiplier=5):
     if not real_offsets:
         return None
 
-    # Build interleaved stsz: real, filler×4, real, filler×4, ...
+    # Non-interleaved stsz: all real sizes, then all filler sizes
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     for i in range(real_count):
-        base = 12 + i * (fake_per_real + 1) * 4
-        struct.pack_into('>I', new_stsz_body, base, real_sizes[i])
-        for j in range(fake_per_real):
-            struct.pack_into('>I', new_stsz_body, base + (1 + j) * 4, FILLER_NAL_SIZE)
+        struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
+    for i in range(fake_count):
+        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, FILLER_NAL_SIZE)
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
     # Replace stsc: all chunks have 1 sample
@@ -476,17 +473,14 @@ def inflate_sample_table_video(data, multiplier=5):
     stsc_delta = len(new_stsc) - stsc_sz
     moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
 
-    # Build interleaved stco
+    # Non-interleaved stco: all real offsets, then all filler offsets
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
-    fake_idx = 0
     for i in range(real_count):
-        base = 8 + i * (fake_per_real + 1) * 4
-        struct.pack_into('>I', new_stco_body2, base, real_offsets[i])
-        for j in range(fake_per_real):
-            pos = mdat_off + mdat_sz + fake_idx * FILLER_NAL_SIZE
-            struct.pack_into('>I', new_stco_body2, base + (1 + j) * 4, pos)
-            fake_idx += 1
+        struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
+    for i in range(fake_count):
+        pos = mdat_off + mdat_sz + i * FILLER_NAL_SIZE
+        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     replacements = [
