@@ -312,7 +312,7 @@ def inflate_sample_table_video(data, multiplier=5):
     # Build stts: 2 entries (real + fake)
     new_stts_data = struct.pack('>IIII', 0, 2, real_count, sample_delta) + \
                     struct.pack('>II', fake_count, sample_delta)
-    new_stts = struct.pack('>I4s', 16 + len(new_stts_data), b'stts') + new_stts_data
+    new_stts = struct.pack('>I4s', 8 + len(new_stts_data), b'stts') + new_stts_data
 
     # Build stsz: all entries (real sizes + 8-byte dummy)
     stsz_body = data[stsz_off+8:stsz_off+20]  # version/flags + uniform_size + count
