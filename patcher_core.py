@@ -345,11 +345,11 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=1.5):
-    """1.5x inflation: non-interleaved, two-entry stts, no filler NALs.
-    Real frames at original delta, filler at small delta.
-    Container durations clipped to real duration.
-    Unique stco entries — no compression.
+def inflate_sample_table_video(data, multiplier=10):
+    """10x inflation: NoBlur-style with same delta for all frames.
+    Real and fake frames use same delta (consistent timing).
+    Small dummy size (8 bytes) at single safeOffset.
+    No duration clipping - preserves original structure.
     """
     data = _patch_avcC_sps(data)
 
@@ -409,12 +409,11 @@ def inflate_sample_table_video(data, multiplier=1.5):
     fake_count = total_count - real_count
     fake_delta = 750
 
-    # Two-entry stts: real frames with original delta, fake frames with small delta
-    # This keeps timing consistent with sample count (stsz/stco have 2x entries)
-    fake_delta = 1  # Small non-zero duration to prevent transcoder hang
-    new_stts_body = struct.pack('>II', 0, 2)
-    new_stts_body += struct.pack('>II', real_count, last_delta)
-    new_stts_body += struct.pack('>II', fake_count, fake_delta)
+    # Single-entry stts: same delta for real and fake frames (NoBlur-style)
+    # This keeps timing consistent - both real and fake use average delta
+    avg_delta = total_ticks // real_count if real_count > 0 else last_delta
+    new_stts_body = struct.pack('>II', 0, 1)
+    new_stts_body += struct.pack('>II', total_count, avg_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Find mdat for offset calculation (no filler NALs added)
@@ -438,14 +437,14 @@ def inflate_sample_table_video(data, multiplier=1.5):
     if not real_offsets:
         return None
 
-    # stsz: cycle through real frame sizes for fake frames (no filler NALs)
+    # stsz: real frames with original sizes, fake frames with 8-byte dummy (NoBlur-style)
+    DUMMY_SIZE = 8  # Small dummy size like NoBlur
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     for i in range(real_count):
         struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
     for i in range(fake_count):
-        # Cycle through real frame sizes
-        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, real_sizes[i % real_count])
+        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, DUMMY_SIZE)
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
     # stsc: all chunks have 1 sample
@@ -460,14 +459,14 @@ def inflate_sample_table_video(data, multiplier=1.5):
     stsc_delta = len(new_stsc) - stsc_sz
     moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
 
-    # stco: cycle through real frame offsets for fake frames (no filler NALs)
+    # stco: real frames with original offsets, fake frames at single safeOffset (NoBlur-style)
+    safe_offset = len(data) + moov_delta  # Offset after moov expansion
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     for i in range(real_count):
-        struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
+        struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i] + moov_delta)
     for i in range(fake_count):
-        # Cycle through real frame offsets
-        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, real_offsets[i % real_count])
+        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, safe_offset)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     replacements = [
@@ -499,50 +498,13 @@ def inflate_sample_table_video(data, multiplier=1.5):
     new_moov_end = moov_off + moov_sz + moov_delta
     _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-    # Clip container durations to real video duration
-    real_sec = total_ticks / 90000.0
-    mvhd_dur = int(real_sec * 1000)
-    mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
-    if mvhd_off != -1:
-        ver = result[mvhd_off+12]
-        if ver == 0:
-            mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
-            mvhd_dur = int(real_sec * mvhd_ts)
-            result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
-        else:
-            mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
-            mvhd_dur = int(real_sec * mvhd_ts)
-            result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
-
-    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
-        tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
-        if tkhd_off != -1:
-            ver = result[tkhd_off+12]
-            if ver == 0:
-                result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', mvhd_dur)
-            else:
-                result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', mvhd_dur)
-
-        mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off == -1:
-            continue
-        hdlr_off, _ = _find_box(result, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1:
-            continue
-        mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
-        if mdhd_off == -1:
-            continue
-        is_video = result[hdlr_off+16:hdlr_off+20] == b'vide'
-        ver = result[mdhd_off+12]
-        if is_video:
-            if ver == 0:
-                mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
-                mdhd_dur = int(real_sec * mdhd_ts)
-                result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
-            else:
-                mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
-                mdhd_dur = int(real_sec * mdhd_ts)
-                result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
+    # Add padding at EOF for dummy data (NoBlur-style)
+    padding_size = fake_count * DUMMY_SIZE
+    result.extend(b'\x00' * padding_size)
+    # Update mdat size to include padding
+    mdat_off_new, mdat_sz_new = _find_box(result, b"mdat")
+    if mdat_off_new != -1:
+        struct.pack_into('>I', result, mdat_off_new, mdat_sz_new + padding_size)
 
     return bytes(result)
 
@@ -759,7 +721,7 @@ def patch_stsd_codec(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
