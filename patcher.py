@@ -4,6 +4,9 @@ import subprocess
 import struct
 import time
 
+# Import shared patching functions from core engine
+from patcher_core import patch_timestamps, patch_language, _adjust_stco
+
 CONTAINERS = [b'moov', b'trak', b'mdia', b'minf', b'stbl', b'edts', b'udta', b'meta', b'ilst']
 VERSION_ATOMS = [b'meta']
 
@@ -220,20 +223,11 @@ def patch_video(input_path, output_path, custom_tag="Patched with VideoBoost", t
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-i", input_path,
         "-c", "copy",
-        "-map_metadata", "-1",
         "-brand", "isom",
         "-video_track_timescale", "90000",
         "-movflags", "+faststart",
-        "-bitexact",
-        "-metadata", "encoder=Lavf60.16.100",
+        "-metadata:s:a:0", "handler_name=SoundHandler",
     ]
-    if title:
-        ffmpeg_cmd += ["-metadata", f"title={title}"]
-    if artist:
-        ffmpeg_cmd += ["-metadata", f"artist={artist}"]
-    if copyright:
-        ffmpeg_cmd += ["-metadata", f"copyright={copyright}"]
-    ffmpeg_cmd += ["-metadata", f"comment={custom_tag}"]
     if encode_1080p:
         ffmpeg_cmd += [
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
@@ -252,42 +246,89 @@ def patch_video(input_path, output_path, custom_tag="Patched with VideoBoost", t
     with open(output_path, 'rb') as f:
         data = bytearray(f.read())
 
-    # Insert free atom (size=8) between ftyp and moov (matches working file)
+    # ---- Insert free atom after ftyp ----
     ftyp_size = int.from_bytes(data[0:4], 'big')
-    data[ftyp_size:ftyp_size] = b'\x00\x00\x00\x08free'
-    print("Free atom: inserted after ftyp (size=8)")
+    next_type = data[ftyp_size+4:ftyp_size+8]
+    if next_type == b'free':
+        print("Free atom already present after ftyp — skipping")
+        pre_shift_extra = 0
+    else:
+        data[ftyp_size:ftyp_size] = b'\x00\x00\x00\x08free'
+        print("Free atom: inserted after ftyp (size=8)")
+        pre_shift_extra = 8
 
-    # Build iTunes-style metadata tree (byte-level injection)
+    # ---- Date zeroing ----
+    data = patch_timestamps(data)
+
+    # ---- Language spoofing ----
+    data = patch_language(data)
+
+    # ---- Build metadata tree ----
     md_tree = build_metadata_tree(artist, copyright, custom_tag)
     md_growth = len(md_tree)
-    print(f"Metadata tree: {md_growth} bytes (ilst box)")
+    print(f"Metadata tree: {md_growth} bytes")
 
-    patched = inject_fake_frames(data, pre_shift=8 + md_growth, stts_overflow=stts_overflow)
+    # ---- Frame inflation ----
+    patched = inject_fake_frames(data, pre_shift=pre_shift_extra, stts_overflow=stts_overflow)
     if patched is None:
         print("Injection failed")
         return
     patched = bytearray(patched)
 
-    # Inject metadata at end of moov
+    # ---- Remove old udta and inject metadata ----
     moov_atom_start = patched.find(b'moov') - 4
     current_moov_size = int.from_bytes(patched[moov_atom_start:moov_atom_start+4], 'big')
     moov_end = moov_atom_start + current_moov_size
+
+    pos = moov_atom_start + 8
+    udta_removed = 0
+    while pos + 8 <= moov_end:
+        atom_size = int.from_bytes(patched[pos:pos+4], 'big')
+        atom_type = patched[pos+4:pos+8]
+        if atom_size < 8:
+            break
+        if atom_type == b'udta':
+            del patched[pos:pos + atom_size]
+            udta_removed = atom_size
+            current_moov_size -= udta_removed
+            moov_end -= udta_removed
+            break
+        pos += atom_size
+
     patched[moov_end:moov_end] = md_tree
     new_moov_size = current_moov_size + md_growth
     patched[moov_atom_start:moov_atom_start+4] = new_moov_size.to_bytes(4, 'big')
-    print(f"Metadata injected: moov {current_moov_size} -> {new_moov_size}")
+    net_shift = md_growth - udta_removed
+    if net_shift != 0:
+        _adjust_stco(patched, net_shift, moov_atom_start, moov_atom_start + new_moov_size)
+    print(f"Metadata injected: moov {current_moov_size} -> {new_moov_size}  (udta_removed={udta_removed})")
 
-    # Corrupt mdat type (mdat -> mdau) so parser doesn't recognize it
-    mdat_pos = patched.find(b'mdat')
-    if mdat_pos >= 4:
-        cur_type = patched[mdat_pos:mdat_pos+4]
-        new_type = (int.from_bytes(cur_type, 'big') + 1).to_bytes(4, 'big')
-        patched[mdat_pos:mdat_pos+4] = new_type
-        print(f"MDAT type: {cur_type} -> {new_type}")
+    # ---- Expand padding after ftyp, target offset=237436 ----
+    target_offset = 237436
+    ftyp_size = int.from_bytes(patched[0:4], 'big')
+    if patched[ftyp_size:ftyp_size+8] == b'\x00\x00\x00\x08free':
+        need = target_offset - 40 - new_moov_size
+        if need >= 8:
+            # Remove ffmpeg free between moov and mdat if present
+            ffmpeg_free_removed = 0
+            moov_end = moov_atom_start + new_moov_size
+            if patched[moov_end:moov_end+8] == b'\x00\x00\x00\x08free':
+                del patched[moov_end:moov_end + 8]
+                ffmpeg_free_removed = 8
+            new_free = struct.pack('>I4s', need, b'free') + b'\x00' * (need - 8)
+            patched[ftyp_size:ftyp_size+8] = new_free
+            shift = need - 8
+            moov_atom_start += shift
+            stco_delta = shift - ffmpeg_free_removed
+            if stco_delta != 0:
+                _adjust_stco(patched, stco_delta, moov_atom_start, moov_atom_start + new_moov_size)
+            print(f"Free atom: 8 -> {need}  (stco_delta={stco_delta:+d})")
+    else:
+        print("Expected free(8) after ftyp not found — skipping padding")
 
-    # Append fake atom with invalid size (4 bytes < 8 minimum)
-    patched += b'\x00\x00\x00\x04xxxx'
-    print("Fake atom: size=4 (invalid, appended at end)")
+    # ---- Fake trailer atom ----
+    patched += b'\x00\x00\x00\x04junk'
+    print("Fake atom: junk(size=4) appended at end")
 
     with open(output_path, 'wb') as f:
         f.write(patched)
