@@ -409,10 +409,12 @@ def inflate_sample_table_video(data, multiplier=5):
     fake_count = total_count - real_count
     fake_delta = 750
 
-    # Single-entry stts with only real frames (prevents playback freeze)
-    # Frame count inflation in stsz/stco still changes fingerprint
-    new_stts_body = struct.pack('>II', 0, 1)
+    # Two-entry stts: real frames with original delta, fake frames with delta=0
+    # This keeps timing consistent with sample count (stsz/stco have 5x entries)
+    fake_delta = 0  # Fake frames contribute no duration
+    new_stts_body = struct.pack('>II', 0, 2)
     new_stts_body += struct.pack('>II', real_count, last_delta)
+    new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Find mdat for filler NAL data
@@ -717,7 +719,7 @@ def patch_stsd_codec(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
