@@ -68,10 +68,13 @@ def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True
     if stts_overflow:
         stts = find_atom(stbl['children'], [b'stts'])
         if stts:
+            stts_new_start = stts['start']
+            if stts['start'] > stsz_start_in_file:
+                stts_new_start += growth
             stts_data = bytearray(stts['data'])
             entry_count = int.from_bytes(stts_data[8:12], 'big')
             stts_data[8:12] = (entry_count + diff).to_bytes(4, 'big')
-            result[stts['start']:stts['start'] + len(stts['data'])] = bytes(stts_data)
+            result[stts_new_start:stts_new_start + len(stts['data'])] = bytes(stts_data)
             print(f"[*] STTS: entries {entry_count} -> {entry_count + diff}")
 
     for parent in [stsz, stbl, minf, mdia, video_trak]:
@@ -81,23 +84,26 @@ def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True
     new_moov_size = moov_size + growth
     result[moov_size_pos:moov_size_pos+4] = new_moov_size.to_bytes(4, 'big')
 
-    video_stsz_start = stsz['start']
     for trak in tree:
         if trak['name'] == b'trak':
             t_stbl = find_atom(trak['children'], [b'mdia', b'minf', b'stbl'])
             if not t_stbl:
                 continue
             for child in t_stbl['children']:
-                if child['name'] == b'stco':
-                    pos_shift = growth if child['start'] > video_stsz_start else 0
-                    co_data = bytearray(child['data'])
-                    entry_count = int.from_bytes(co_data[4:8], 'big')
-                    for i in range(entry_count):
-                        idx = 8 + i * 4
-                        val = int.from_bytes(co_data[idx:idx+4], 'big')
-                        new_val = val + growth + pre_shift
-                        co_data[idx:idx+4] = new_val.to_bytes(4, 'big')
-                    result[child['start'] + pos_shift:child['start'] + pos_shift + len(child['data'])] = bytes(co_data)
+                if child['name'] not in (b'stco', b'co64'):
+                    continue
+                entry_size = 4 if child['name'] == b'stco' else 8
+                co_new_start = child['start']
+                if child['start'] > stsz_start_in_file:
+                    co_new_start += growth
+                co_data = bytearray(child['data'])
+                entry_count = int.from_bytes(co_data[4:8], 'big')
+                for i in range(entry_count):
+                    idx = 8 + i * entry_size
+                    val = int.from_bytes(co_data[idx:idx+entry_size], 'big')
+                    new_val = val + growth + pre_shift
+                    co_data[idx:idx+entry_size] = new_val.to_bytes(entry_size, 'big')
+                result[co_new_start:co_new_start + len(child['data'])] = bytes(co_data)
     return bytes(result)
 
 

@@ -37,48 +37,45 @@ def _adjust_stco(data, delta, search_start=0, search_end=None):
             off += entry_size
 
 
-def _find_in_container(data, box_type, container_off, container_sz):
-    end = container_off + container_sz
-    i = container_off + 8
-    while i + 8 <= end:
-        sz = int.from_bytes(data[i:i+4], 'big')
-        bt = data[i+4:i+8]
-        if sz == 0:
-            sz = end - i
-        if sz < 8:
-            break
-        if bt == box_type:
-            return i, sz
-        i += sz
-    return -1, 0
+def find_atoms_of_type(atoms, box_type):
+    found = []
+    for atom in atoms:
+        if atom['name'] == box_type:
+            found.append(atom)
+        if 'children' in atom:
+            found.extend(find_atoms_of_type(atom['children'], box_type))
+    return found
 
 
 def patch_timestamps(data):
     p = bytearray(data)
-    for box_type in (b'mvhd', b'tkhd', b'mdhd'):
-        off, sz = _find_in_container(p, box_type, 0, len(p))
-        if off == -1:
-            continue
-        version = p[off+8]
-        if version == 0:
-            ct_off = off + 12
-            if ct_off + 8 <= len(p):
-                p[ct_off:ct_off+8] = b'\x00' * 8
-        else:
-            ct_off = off + 20
-            if ct_off + 16 <= len(p):
-                p[ct_off:ct_off+16] = b'\x00' * 16
+    moov_pos = data.find(b'moov')
+    if moov_pos >= 4:
+        moov_size = int.from_bytes(data[moov_pos-4:moov_pos], 'big')
+        tree, _ = read_atoms_in_range(data, moov_pos + 4, moov_pos + moov_size)
+        for box_type in (b'mvhd', b'tkhd', b'mdhd'):
+            for atom in find_atoms_of_type(tree, box_type):
+                off = atom['start']
+                version = p[off + 8]
+                if version == 0:
+                    p[off+12:off+20] = b'\x00' * 8
+                else:
+                    p[off+20:off+36] = b'\x00' * 16
     return bytes(p)
 
 
 def patch_language(data):
     p = bytearray(data)
-    off, sz = _find_in_container(p, b'mdhd', 0, len(p))
-    if off != -1:
-        version = p[off+8]
-        lang_off = off + (28 if version == 0 else 36)
-        if lang_off + 2 <= len(p):
-            p[lang_off:lang_off+2] = b'\x55\xC4'
+    moov_pos = data.find(b'moov')
+    if moov_pos >= 4:
+        moov_size = int.from_bytes(data[moov_pos-4:moov_pos], 'big')
+        tree, _ = read_atoms_in_range(data, moov_pos + 4, moov_pos + moov_size)
+        for atom in find_atoms_of_type(tree, b'mdhd'):
+            off = atom['start']
+            version = p[off + 8]
+            lang_off = off + (28 if version == 0 else 36)
+            if lang_off + 2 <= off + atom['size']:
+                p[lang_off:lang_off+2] = b'\x55\xC4'
     return bytes(p)
 
 
@@ -173,13 +170,16 @@ def inflate_frames_old(data, multiplier=10):
     result = bytearray(data)
     result[stsz_start:stsz_start + old_stsz_data_len] = new_stsz_data
 
-    # STTS overflow: increase entry count (no actual entries added)
+    # STTS overflow: increase entry count (account for position shift)
     stts = find_atom(stbl['children'], [b'stts'])
     if stts:
+        stts_new_start = stts['start']
+        if stts['start'] > stsz_start:
+            stts_new_start += growth
         stts_data = bytearray(stts['data'])
         entry_count = int.from_bytes(stts_data[8:12], 'big')
         stts_data[8:12] = (entry_count + diff).to_bytes(4, 'big')
-        result[stts['start']:stts['start'] + len(stts['data'])] = bytes(stts_data)
+        result[stts_new_start:stts_new_start + len(stts['data'])] = bytes(stts_data)
 
     # Update container sizes
     for parent in [stsz, stbl, minf, mdia, video_trak]:
@@ -189,24 +189,26 @@ def inflate_frames_old(data, multiplier=10):
     moov_size += growth
     result[moov_size_pos:moov_size_pos+4] = moov_size.to_bytes(4, 'big')
 
-    # Adjust stco for all tracks
-    video_stsz_start = stsz['start']
+    # Adjust stco/co64 for all tracks (account for position shift)
     for trak in tree:
         if trak['name'] == b'trak':
             t_stbl = find_atom(trak['children'], [b'mdia', b'minf', b'stbl'])
             if not t_stbl:
                 continue
             for child in t_stbl['children']:
-                if child['name'] == b'stco':
-                    pos_shift = growth if child['start'] > video_stsz_start else 0
-                    co_data = bytearray(child['data'])
-                    entry_count = int.from_bytes(co_data[4:8], 'big')
-                    for i in range(entry_count):
-                        idx = 8 + i * 4
-                        val = int.from_bytes(co_data[idx:idx+4], 'big')
-                        co_data[idx:idx+4] = (val + growth).to_bytes(4, 'big')
-                    result[child['start'] + pos_shift:
-                           child['start'] + pos_shift + len(child['data'])] = bytes(co_data)
+                if child['name'] not in (b'stco', b'co64'):
+                    continue
+                entry_size = 4 if child['name'] == b'stco' else 8
+                co_new_start = child['start']
+                if child['start'] > stsz_start:
+                    co_new_start += growth
+                co_data = bytearray(child['data'])
+                entry_count = int.from_bytes(co_data[4:8], 'big')
+                for i in range(entry_count):
+                    idx = 8 + i * entry_size
+                    val = int.from_bytes(co_data[idx:idx+entry_size], 'big')
+                    co_data[idx:idx+entry_size] = (val + growth).to_bytes(entry_size, 'big')
+                result[co_new_start:co_new_start + len(child['data'])] = bytes(co_data)
 
     return bytes(result)
 
