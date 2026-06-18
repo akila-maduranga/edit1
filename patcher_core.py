@@ -172,8 +172,14 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
     if custom_tag:
         entries[b'\xa9cmt'] = custom_tag
 
-    # Build Apple-style meta/ilst/data wrapper
+    # Build direct udta children (TikTok reads these)
     udta_data = b''
+    for tag_key, value in entries.items():
+        value_bytes = value.encode('utf-8')
+        tag_box = struct.pack('>I4s', 8 + len(value_bytes), tag_key) + value_bytes
+        udta_data += tag_box
+
+    # Build Apple-style meta/ilst/data wrapper for compatibility
     ilst_data = b''
     for tag_key, value in entries.items():
         value_bytes = value.encode('utf-8')

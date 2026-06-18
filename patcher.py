@@ -185,6 +185,14 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
     if custom_tag:
         entries[b'\xa9cmt'] = custom_tag
 
+    # Build direct udta children (TikTok reads these)
+    udta_data = b''
+    for tag_key, value in entries.items():
+        value_bytes = value.encode('utf-8')
+        tag_box = struct.pack('>I4s', 8 + len(value_bytes), tag_key) + value_bytes
+        udta_data += tag_box
+
+    # Build Apple-style meta/ilst/data wrapper for compatibility
     ilst_data = b''
     for tag_key, value in entries.items():
         value_bytes = value.encode('utf-8')
@@ -200,7 +208,8 @@ def build_metadata_tree(artist, copyright, custom_tag, encoder="Lavf60.16.100"):
     hdlr += b'Metadata\x00'  # component name
     meta_content = b'\x00\x00\x00\x00' + hdlr + ilst
     meta = struct.pack('>I4s', 8 + len(meta_content), b'meta') + meta_content
-    return struct.pack('>I4s', 8 + len(meta), b'udta') + meta
+    udta_data += meta
+    return struct.pack('>I4s', 8 + len(udta_data), b'udta') + udta_data
 
 
 def patch_video(input_path, output_path, custom_tag="Patched with VideoBoost", title="", artist="akila", copyright="akila", encode_1080p=False, stts_overflow=True):
