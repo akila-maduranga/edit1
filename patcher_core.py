@@ -357,11 +357,10 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation: interleaved real/filler NALs with 1894-entry stts.
-    Each real frame followed by 4 filler NALs at 120fps (delta=750).
-    No contiguous freeze — max 33ms between real frames.
-    Unique stco entries — no compression.
+def inflate_sample_table_video(data, multiplier=4):
+    """4x inflation: two-entry stts + filler NALs at end (non-interleaved).
+    Real frames at original delta (60fps), then filler NALs at delta=750.
+    Unique stco entries — no compression. Shorter freeze than 5x.
     """
     data = _patch_avcC_sps(data)
 
@@ -417,14 +416,12 @@ def inflate_sample_table_video(data, multiplier=5):
     orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
     total_count = real_count * multiplier
     fake_count = total_count - real_count
-    fake_per_real = multiplier - 1
     fake_delta = 750
 
-    # 1894-entry interleaved stts: (1, last_delta), (4, 750) × 947
-    new_stts_body = struct.pack('>II', 0, real_count * 2)
-    for _ in range(real_count):
-        new_stts_body += struct.pack('>II', 1, last_delta)
-        new_stts_body += struct.pack('>II', fake_per_real, fake_delta)
+    # Two-entry stts
+    new_stts_body = struct.pack('>II', 0, 2)
+    new_stts_body += struct.pack('>II', real_count, last_delta)
+    new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Find mdat for filler NAL data
@@ -451,14 +448,13 @@ def inflate_sample_table_video(data, multiplier=5):
     if not real_offsets:
         return None
 
-    # Interleaved stsz: real, filler×4, real, filler×4, ...
+    # Non-interleaved stsz: all real, then all filler
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     for i in range(real_count):
-        base = 12 + i * (fake_per_real + 1) * 4
-        struct.pack_into('>I', new_stsz_body, base, real_sizes[i])
-        for j in range(fake_per_real):
-            struct.pack_into('>I', new_stsz_body, base + (1 + j) * 4, FILLER_NAL_SIZE)
+        struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
+    for i in range(fake_count):
+        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, FILLER_NAL_SIZE)
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
     # stsc: all chunks have 1 sample
@@ -473,17 +469,14 @@ def inflate_sample_table_video(data, multiplier=5):
     stsc_delta = len(new_stsc) - stsc_sz
     moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
 
-    # Interleaved stco: real_offset, filler×4, real_offset, filler×4, ...
+    # Non-interleaved stco: all real offsets, then all filler offsets
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
-    fake_idx = 0
     for i in range(real_count):
-        base = 8 + i * (fake_per_real + 1) * 4
-        struct.pack_into('>I', new_stco_body2, base, real_offsets[i])
-        for j in range(fake_per_real):
-            pos = mdat_off + mdat_sz + fake_idx * FILLER_NAL_SIZE
-            struct.pack_into('>I', new_stco_body2, base + (1 + j) * 4, pos)
-            fake_idx += 1
+        struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
+    for i in range(fake_count):
+        pos = mdat_off + mdat_sz + i * FILLER_NAL_SIZE
+        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     replacements = [
@@ -735,7 +728,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     if log_func:
         log_func("")
         log_func("── 6/7  Frame Count Inflation (single-entry stts delta=750, interleaved) ─────")
-    inflated = inflate_sample_table_video(data, multiplier=5)
+    inflated = inflate_sample_table_video(data, multiplier=4)
     if inflated is None:
         if log_func:
             log_func("[ERROR] Frame inflation failed")
