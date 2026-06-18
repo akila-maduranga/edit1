@@ -427,15 +427,20 @@ def inflate_sample_table_video(data, multiplier=5, original_size=None):
     if not real_offsets:
         return None
 
-    # Use filler NALs (type 0 = unspecified, ignored by decoders)
-    FILLER_NAL = b'\x00\x00\x00\x01\x00'
-    FILLER_NAL_SIZE = 64
+    # Read real frame data from mdat for filler cycling
+    real_frame_data = []
+    for off, sz in real_offsets:
+        real_frame_data.append(data[off:off+sz])
+
+    # Build filler data: cycle real frames, append 0x80 to each
+    # filler frame to vary hash without affecting decoded output
+    # (trailing stop bit is ignored by decoders)
     filler_data = bytearray()
+    filler_sizes = []
     for i in range(fake_count):
-        frame = bytearray(FILLER_NAL_SIZE)
-        frame[:len(FILLER_NAL)] = FILLER_NAL
-        frame[5] = i & 0xFF  # vary one byte per frame to avoid duplicate detection
-        filler_data += frame
+        src = real_frame_data[i % real_count]
+        filler_data += src + b'\x80'
+        filler_sizes.append(len(src) + 1)
 
     # Non-interleaved stsz: all real, then all filler
     new_stsz_body = bytearray(20 + total_count * 4)
@@ -443,7 +448,7 @@ def inflate_sample_table_video(data, multiplier=5, original_size=None):
     for i in range(real_count):
         struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
     for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, FILLER_NAL_SIZE)
+        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, filler_sizes[i])
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
     # stsc: all chunks have 1 sample
@@ -464,7 +469,7 @@ def inflate_sample_table_video(data, multiplier=5, original_size=None):
     for i in range(real_count):
         struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
     for i in range(fake_count):
-        pos = mdat_off + mdat_sz + i * FILLER_NAL_SIZE
+        pos = mdat_off + mdat_sz + sum(filler_sizes[:i])
         struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
