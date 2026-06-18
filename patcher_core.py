@@ -269,11 +269,11 @@ def fingerprint_tkhd(data):
     return bytes(p)
 
 
-# ── Frame Density Inflation (5x, valid H.264 filler NALs at EOF) ───────
+# ── Frame Density Inflation (3x, valid H.264 filler NALs at EOF) ───────
 
 FILLER_NAL = b'\x00\x00\x00\x01\x0c\x00\x00\x80'  # 8-byte H.264 filler (ignored by decoder)
 
-def inflate_sample_table_video(data, multiplier=5):
+def inflate_sample_table_video(data, multiplier=3):
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
@@ -315,12 +315,14 @@ def inflate_sample_table_video(data, multiplier=5):
     # Read original sample count from stts (support multiple entries)
     stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
     real_count = 0
+    last_delta = 0
     stts_entries = []
     for i in range(stts_entry_count):
         off = stts_off + 16 + i * 8
         cnt = int.from_bytes(data[off:off+4], 'big')
         delta = int.from_bytes(data[off+4:off+8], 'big')
         real_count += cnt
+        last_delta = delta
         stts_entries.append((cnt, delta))
     if real_count == 0:
         return None
@@ -329,11 +331,11 @@ def inflate_sample_table_video(data, multiplier=5):
     total_count = real_count * multiplier
     fake_count = total_count - real_count
 
-    # Build stts: original entries + 1 extra for fake frames (duration=1)
+    # Build stts: original entries + 1 extra for fake frames
     new_stts_body = struct.pack('>II', 0, stts_entry_count + 1)
     for cnt, delta in stts_entries:
         new_stts_body += struct.pack('>II', cnt, delta)
-    new_stts_body += struct.pack('>II', fake_count, 1)
+    new_stts_body += struct.pack('>II', fake_count, last_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Build stsz: all entries (real sizes + 8-byte filler)
@@ -637,8 +639,8 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ── Pass 6: Frame Density Inflation (5x, 8-byte dummy, EOF padding) ──
     if log_func:
         log_func("")
-        log_func("── 6/7  Frame Density Inflation (5x) ───────────────────────")
-    inflated = inflate_sample_table_video(data, multiplier=5)
+        log_func("── 6/7  Frame Density Inflation (3x) ───────────────────────")
+    inflated = inflate_sample_table_video(data)
     if inflated is None:
         if log_func:
             log_func("[ERROR] Frame inflation failed")
