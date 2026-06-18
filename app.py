@@ -25,7 +25,7 @@ _job_output: dict[str, str]         = {}
 
 
 def run_job(job_id: str, src: Path, original_name: str, comment: str,
-            use_inflation=True, brand_spoof_only=False, minimal=False):
+            use_inflation=True, brand_spoof_only=False, minimal=False, multiplier=5):
     log = _job_logs[job_id]
     _job_status[job_id] = "running"
 
@@ -36,7 +36,7 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str,
     try:
         log.put(f"[JOB]  {job_id[:8]}... started")
         log.put(f"[JOB]  input: {original_name}  ({src.stat().st_size:,} bytes)")
-        log.put(f"[JOB]  mode: {'brand-only' if brand_spoof_only else 'no-inflate' if not use_inflation else 'inflation'}")
+        log.put(f"[JOB]  mode: {'brand-only' if brand_spoof_only else 'no-inflate' if not use_inflation else 'inflation'} (multiplier={multiplier})")
 
         from patcher_core import patch_all
 
@@ -45,7 +45,7 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str,
 
         success = patch_all(src, out_path, comment=comment, log_func=log_func,
                             use_inflation=use_inflation, brand_spoof_only=brand_spoof_only,
-                            minimal=minimal)
+                            minimal=minimal, multiplier=multiplier)
 
         if success:
             _job_output[job_id] = f"{job_id}_{out_name}"
@@ -78,6 +78,7 @@ def upload():
     use_inflation = request.form.get("mode", "inflation") == "inflation"
     brand_only    = request.form.get("mode", "inflation") == "brand-only"
     minimal_mode  = request.form.get("mode", "inflation") == "minimal"
+    mul = int(request.form.get("multiplier", "5"))
     job_id   = str(uuid.uuid4())
     dest     = UPLOAD_DIR / f"{job_id}_input.mp4"
     f.save(dest)
@@ -85,7 +86,7 @@ def upload():
     _job_logs[job_id] = queue.Queue()
     threading.Thread(target=run_job, args=(job_id, dest, f.filename, comment),
                      kwargs={"use_inflation": use_inflation, "brand_spoof_only": brand_only,
-                             "minimal": minimal_mode},
+                             "minimal": minimal_mode, "multiplier": mul},
                      daemon=True).start()
     return jsonify({"job_id": job_id})
 

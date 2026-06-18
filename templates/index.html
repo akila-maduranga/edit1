@@ -307,6 +307,14 @@
     </label>
   </div>
 
+  <!-- Multiplier -->
+  <div style="display:flex;align-items:center;gap:10px;font-size:12px">
+    <label for="mul-input">Multiplier:</label>
+    <input type="number" id="mul-input" value="5" min="2" max="10" step="1"
+           style="width:60px;padding:4px 8px;background:var(--surface);border:1px solid var(--border);border-radius:3px;color:var(--text);font-family:var(--mono);font-size:12px">
+    <span style="color:var(--muted)">(higher = more anti-compression, more freeze)</span>
+  </div>
+
   <!-- Run -->
   <button id="run-btn" disabled>▶ Patch Video</button>
 
@@ -403,6 +411,7 @@
     const fd = new FormData();
     fd.append('file', selectedFile);
     fd.append('mode', document.querySelector('input[name="mode"]:checked')?.value || 'inflation');
+    fd.append('multiplier', document.getElementById('mul-input')?.value || '5');
     appendLog(`[JOB] uploading ${selectedFile.name}…`);
 
     let jobId;
