@@ -763,7 +763,7 @@ def patch_stsd_bitrate(data, bitrate=100_000_000):
         entry_end = entry_off + entry_sz
         btrt_off, btrt_sz = _find_box(result, b"btrt", entry_off+8, entry_end)
         if btrt_off != -1:
-            struct.pack_into('>III', result, btrt_off+12, bitrate//8, bitrate, bitrate)
+            struct.pack_into('>III', result, btrt_off+8, bitrate//8, bitrate, bitrate)
             break
     return bytes(result)
 
