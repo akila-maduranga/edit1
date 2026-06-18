@@ -370,7 +370,7 @@ def inflate_sample_table_video(data, multiplier=5):
         val = int.from_bytes(data[stco_base+i*4:stco_base+i*4+4], 'big')
         struct.pack_into('>I', new_stco_body2, 8 + i*4, val)
     for i in range(fake_count):
-        struct.pack_into('>I', new_stco_body2, 8 + orig_stco_count*4 + i*4, safe_offset)
+        struct.pack_into('>I', new_stco_body2, 8 + orig_stco_count*4 + i*4, safe_offset + i * DUMMY_SAMPLE_SIZE)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     # Replace atoms in order: stts, stsz, stsc, stco
@@ -406,8 +406,9 @@ def inflate_sample_table_video(data, multiplier=5):
     new_moov_end = moov_off + moov_sz + moov_delta
     _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-    # Write EOF padding for dummy samples
-    result[write_pos:write_pos + padding_size] = b'\x00' * padding_size
+    # Write EOF padding for dummy samples (random data, not zeros)
+    if padding_size:
+        result[write_pos:write_pos + padding_size] = random.randbytes(padding_size)
 
     return bytes(result)
 
@@ -535,7 +536,8 @@ def patch_audio_duration(data, original_duration):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None):
+def patch_all(input_path, output_path, comment=None, log_func=None,
+              multiplier=2, edts_bypass=True, mvhd_patch=True, tkhd_reset=True):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
@@ -588,20 +590,30 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         _dump_atoms(data, "REBASE", log_func)
 
     # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ────────────────
-    if log_func:
-        log_func("")
-        log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
-    data = rebuild_elst_bypass(data)
-    if log_func:
-        log_func("[ELST] done")
+    if edts_bypass:
+        if log_func:
+            log_func("")
+            log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
+        data = rebuild_elst_bypass(data)
+        if log_func:
+            log_func("[ELST] done")
+    else:
+        if log_func:
+            log_func("")
+            log_func("── 2/7  ZeroLoss Bypass ─ SKIPPED ───────────────────────────")
 
     # ── Pass 3: Quantum Matrix Patch (mvhd matrix) ──────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 3/7  Quantum Matrix Patch (mvhd) ───────────────────────")
-    data = patch_mvhd_matrix(data)
-    if log_func:
-        log_func("[MVHD] done")
+    if mvhd_patch:
+        if log_func:
+            log_func("")
+            log_func("── 3/7  Quantum Matrix Patch (mvhd) ───────────────────────")
+        data = patch_mvhd_matrix(data)
+        if log_func:
+            log_func("[MVHD] done")
+    else:
+        if log_func:
+            log_func("")
+            log_func("── 3/7  MVHD Matrix Patch ─ SKIPPED ─────────────────────────")
 
     # ── Pass 4: Udta Strip ──────────────────────────────────────────────
     if log_func:
@@ -614,18 +626,23 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
         log_func(f"[UDTA] stripped {stripped} bytes" if stripped else "[UDTA] none found")
 
     # ── Pass 5: Tkhd Matrix Reset ───────────────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 5/7  Tkhd Matrix Reset ──────────────────────────────────")
-    data = reset_tkhd_matrices(data)
-    if log_func:
-        log_func("[TKHD] done")
+    if tkhd_reset:
+        if log_func:
+            log_func("")
+            log_func("── 5/7  Tkhd Matrix Reset ──────────────────────────────────")
+        data = reset_tkhd_matrices(data)
+        if log_func:
+            log_func("[TKHD] done")
+    else:
+        if log_func:
+            log_func("")
+            log_func("── 5/7  Tkhd Matrix Reset ─ SKIPPED ─────────────────────────")
 
-    # ── Pass 6: Frame Density Inflation (5x, 8-byte dummy, EOF padding) ──
+    # ── Pass 6: Frame Density Inflation ─────────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 6/7  Frame Density Inflation (5x) ───────────────────────")
-    inflated = inflate_sample_table_video(data, multiplier=5)
+        log_func(f"── 6/7  Frame Density Inflation ({multiplier}x) ─────────────────")
+    inflated = inflate_sample_table_video(data, multiplier=multiplier)
     if inflated is None:
         if log_func:
             log_func("[ERROR] Frame inflation failed")

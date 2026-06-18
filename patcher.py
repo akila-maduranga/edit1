@@ -16,10 +16,25 @@ if __name__ == "__main__":
     p.add_argument("-o", "--output", default="patched_output.mp4", help="Output path")
     p.add_argument("--comment", default=None,
                    help="\xa9cmt comment (default: auto-generated timestamped tag)")
+    p.add_argument("--multiplier", type=int, default=2, choices=[1, 2, 3, 4, 5],
+                   help="Frame inflation multiplier (default: 2)")
+    p.add_argument("--no-edts", action="store_true",
+                   help="Skip edts/elst ZeroLoss bypass")
+    p.add_argument("--no-mvhd", action="store_true",
+                   help="Skip mvhd matrix patch")
+    p.add_argument("--no-tkhd", action="store_true",
+                   help="Skip tkhd matrix reset")
     args = p.parse_args()
 
     def log(msg):
         print(msg)
 
-    ok = patch_all(args.input, args.output, comment=args.comment, log_func=log)
+    ok = patch_all(
+        args.input, args.output,
+        comment=args.comment, log_func=log,
+        multiplier=args.multiplier,
+        edts_bypass=not args.no_edts,
+        mvhd_patch=not args.no_mvhd,
+        tkhd_reset=not args.no_tkhd,
+    )
     sys.exit(0 if ok else 1)
