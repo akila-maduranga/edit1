@@ -717,7 +717,7 @@ def patch_stsd_codec(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
