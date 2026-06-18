@@ -82,78 +82,131 @@ def patch_language(data):
     return bytes(p)
 
 
+# ── Tree-based box parsing (shared with patcher.py) ─────────────────
+
+def read_atoms_in_range(data, offset, end_pos):
+    atoms = []
+    while offset + 8 <= end_pos and offset + 8 <= len(data):
+        size = int.from_bytes(data[offset:offset+4], 'big')
+        if size == 0:
+            break
+        if size == 1:
+            size = int.from_bytes(data[offset+8:offset+16], 'big')
+            header_size = 16
+        else:
+            header_size = 8
+        atom_end = offset + size
+        if atom_end > end_pos:
+            atom_end = end_pos
+        name = data[offset+4:offset+8]
+        CONTAINERS = [b'moov', b'trak', b'mdia', b'minf', b'stbl']
+        if name in CONTAINERS:
+            children, _ = read_atoms_in_range(data, offset + header_size, atom_end)
+            atoms.append({'name': name, 'children': children, 'start': offset, 'size': size})
+        else:
+            atoms.append({'name': name, 'data': bytes(data[offset+header_size:atom_end]),
+                          'start': offset, 'size': size})
+        offset = atom_end
+    return atoms, offset
+
+
+def find_atom(atoms, path):
+    if not path:
+        return atoms
+    for atom in atoms:
+        if atom['name'] == path[0]:
+            if len(path) == 1:
+                return atom
+            if 'children' in atom:
+                res = find_atom(atom['children'], path[1:])
+                if res:
+                    return res
+    return None
+
+
 # ── Frame inflation (old approach: 0-byte dummies + stts overflow) ──
 
 def inflate_frames_old(data, multiplier=10):
     """Inject zero-size dummy frames + stts entry count overflow."""
-    moov_off, moov_sz = _find_in_container(data, b'moov', 0, len(data))
-    if moov_off == -1:
+    moov_pos = data.find(b'moov')
+    if moov_pos < 4:
+        return None
+    moov_size_pos = moov_pos - 4
+    moov_size = int.from_bytes(data[moov_size_pos:moov_size_pos+4], 'big')
+
+    tree, _ = read_atoms_in_range(data, moov_pos + 4, moov_pos + moov_size)
+
+    video_trak = None
+    for atom in tree:
+        if atom['name'] == b'trak':
+            hdlr = find_atom(atom['children'], [b'mdia', b'hdlr'])
+            if hdlr and b'vide' in hdlr['data']:
+                video_trak = atom
+                break
+    if not video_trak:
         return None
 
-    # Find video stbl
-    video_stbl_off = None
-    pos = moov_off + 8
-    moov_end = moov_off + moov_sz
-    while pos + 8 <= moov_end:
-        trak_sz = int.from_bytes(data[pos:pos+4], 'big')
-        if data[pos+4:pos+8] != b'trak':
-            pos += trak_sz
-            continue
-        mdia_off, mdia_sz = _find_in_container(data, b'mdia', pos, trak_sz)
-        if mdia_off == -1:
-            pos += trak_sz; continue
-        hdlr_off, _ = _find_in_container(data, b'hdlr', mdia_off, mdia_sz)
-        if hdlr_off == -1:
-            pos += trak_sz; continue
-        if data[hdlr_off+16:hdlr_off+20] != b'vide':
-            pos += trak_sz; continue
-        minf_off, minf_sz = _find_in_container(data, b'minf', mdia_off, mdia_sz)
-        if minf_off == -1:
-            pos += trak_sz; continue
-        video_stbl_off, video_stbl_sz = _find_in_container(data, b'stbl', minf_off, minf_sz)
-        if video_stbl_off != -1:
-            break
-        pos += trak_sz
+    stbl = find_atom(video_trak['children'], [b'mdia', b'minf', b'stbl'])
+    if not stbl:
+        return None
+    minf = find_atom(video_trak['children'], [b'mdia', b'minf'])
+    mdia = find_atom(video_trak['children'], [b'mdia'])
 
-    if video_stbl_off is None:
+    stsz = find_atom(stbl['children'], [b'stsz'])
+    if not stsz:
         return None
 
-    stbl_off, stbl_sz = video_stbl_off, video_stbl_sz
-    stbl_end = stbl_off + stbl_sz
-    stsz_off, stsz_sz = _find_in_container(data, b'stsz', stbl_off, stbl_sz)
-    stts_off, stts_sz = _find_in_container(data, b'stts', stbl_off, stbl_sz)
-    if stsz_off == -1 or stts_off == -1:
-        return None
+    stsz_data = bytearray(stsz['data'])
+    orig_count = int.from_bytes(stsz_data[8:12], 'big')
+    total_frames = orig_count * multiplier
+    diff = total_frames - orig_count
+    if diff <= 0:
+        return data
 
-    stsz_sample_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
-    uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
-    total_frames = stsz_sample_count * multiplier
-    diff = total_frames - stsz_sample_count
+    new_entries = b'\x00\x00\x00\x00' * diff
+    stsz_start = stsz['start']
+    old_stsz_data_len = len(stsz['data'])
+    stsz_data[8:12] = total_frames.to_bytes(4, 'big')
+    new_stsz_data = bytes(stsz_data) + new_entries
+    growth = len(new_stsz_data) - old_stsz_data_len
 
     result = bytearray(data)
+    result[stsz_start:stsz_start + old_stsz_data_len] = new_stsz_data
 
-    # Update STSZ: set sample_count + add zero-size entries
-    old_stsz_data_len = stsz_sz - 8
-    new_stsz_data = bytearray(data[stsz_off+8:stsz_off+stsz_sz])
-    new_stsz_data[8:12] = total_frames.to_bytes(4, 'big')
-    new_stsz_data += b'\x00\x00\x00\x00' * diff  # zero-size dummy entries
-    growth = len(new_stsz_data) - old_stsz_data_len
-    result[stsz_off+8:stsz_off+8+old_stsz_data_len] = new_stsz_data
-
-    # Update STTS: add entry count overflow (each dummy = separate stts entry)
-    old_stts_data_len = stts_sz - 8
-    stts_data = bytearray(data[stts_off+8:stts_off+stts_sz])
-    entry_count = int.from_bytes(stts_data[8:12], 'big')
-    stts_data[8:12] = (entry_count + diff).to_bytes(4, 'big')
-    result[stts_off+8:stts_off+8+old_stts_data_len] = bytes(stts_data)
+    # STTS overflow: increase entry count (no actual entries added)
+    stts = find_atom(stbl['children'], [b'stts'])
+    if stts:
+        stts_data = bytearray(stts['data'])
+        entry_count = int.from_bytes(stts_data[8:12], 'big')
+        stts_data[8:12] = (entry_count + diff).to_bytes(4, 'big')
+        result[stts['start']:stts['start'] + len(stts['data'])] = bytes(stts_data)
 
     # Update container sizes
-    for parent_off in (stbl_off, minf_off, mdia_off, pos, moov_off):
-        old_sz = int.from_bytes(result[parent_off:parent_off+4], 'big')
-        struct.pack_into('>I', result, parent_off, old_sz + growth)
+    for parent in [stsz, stbl, minf, mdia, video_trak]:
+        old_sz = parent['size']
+        new_sz = old_sz + growth
+        result[parent['start']:parent['start'] + 4] = new_sz.to_bytes(4, 'big')
+    moov_size += growth
+    result[moov_size_pos:moov_size_pos+4] = moov_size.to_bytes(4, 'big')
 
-    new_moov_sz = moov_sz + growth
-    _adjust_stco(result, growth, moov_off+8, moov_off+8+new_moov_sz)
+    # Adjust stco for all tracks
+    video_stsz_start = stsz['start']
+    for trak in tree:
+        if trak['name'] == b'trak':
+            t_stbl = find_atom(trak['children'], [b'mdia', b'minf', b'stbl'])
+            if not t_stbl:
+                continue
+            for child in t_stbl['children']:
+                if child['name'] == b'stco':
+                    pos_shift = growth if child['start'] > video_stsz_start else 0
+                    co_data = bytearray(child['data'])
+                    entry_count = int.from_bytes(co_data[4:8], 'big')
+                    for i in range(entry_count):
+                        idx = 8 + i * 4
+                        val = int.from_bytes(co_data[idx:idx+4], 'big')
+                        co_data[idx:idx+4] = (val + growth).to_bytes(4, 'big')
+                    result[child['start'] + pos_shift:
+                           child['start'] + pos_shift + len(child['data'])] = bytes(co_data)
 
     return bytes(result)
 

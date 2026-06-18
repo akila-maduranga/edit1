@@ -7,47 +7,7 @@ import sys
 import subprocess
 import struct
 import time
-from patcher_core import patch_timestamps, patch_language, _adjust_stco
-
-
-def read_atoms_in_range(data, offset, end_pos):
-    atoms = []
-    while offset + 8 <= end_pos and offset + 8 <= len(data):
-        size = int.from_bytes(data[offset:offset+4], 'big')
-        if size == 0:
-            break
-        if size == 1:
-            size = int.from_bytes(data[offset+8:offset+16], 'big')
-            header_size = 16
-        else:
-            header_size = 8
-        atom_end = offset + size
-        if atom_end > end_pos:
-            atom_end = end_pos
-        name = data[offset+4:offset+8]
-        CONTAINERS = [b'moov', b'trak', b'mdia', b'minf', b'stbl']
-        if name in CONTAINERS:
-            children, _ = read_atoms_in_range(data, offset + header_size, atom_end)
-            atoms.append({'name': name, 'children': children, 'start': offset, 'size': size})
-        else:
-            atoms.append({'name': name, 'data': bytes(data[offset+header_size:atom_end]),
-                          'start': offset, 'size': size})
-        offset = atom_end
-    return atoms, offset
-
-
-def find_atom(atoms, path):
-    if not path:
-        return atoms
-    for atom in atoms:
-        if atom['name'] == path[0]:
-            if len(path) == 1:
-                return atom
-            if 'children' in atom:
-                res = find_atom(atom['children'], path[1:])
-                if res:
-                    return res
-    return None
+from patcher_core import patch_timestamps, patch_language, _adjust_stco, read_atoms_in_range, find_atom
 
 
 def inject_fake_frames(data, target_frames=None, pre_shift=0, stts_overflow=True):
