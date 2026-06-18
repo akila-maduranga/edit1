@@ -319,8 +319,9 @@ def _patch_avcC_sps(data):
 
 
 def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation: two-entry stts + filler NALs + avcC/SPS patch.
-    Uses delta=750 (120fps) for fake frames — known to pass TikTok.
+    """5x inflation: two-entry stts + filler NALs in mdat extension + avcC/SPS patch.
+    Uses delta=750 (120fps) for fake frames — known to pass processing.
+    Filler NALs produce no new picture (static frame) but are valid H.264.
     """
     data = _patch_avcC_sps(data)
 
@@ -387,7 +388,15 @@ def inflate_sample_table_video(data, multiplier=5):
     new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-    # Read real frame sizes and chunk offsets
+    # Find mdat for fake frame data (filler NALs appended after real mdat)
+    mdat_off, mdat_sz = _find_box(data, b"mdat")
+    if mdat_off == -1:
+        return None
+    FILLER_NAL = b'\x00\x00\x00\x01\x0c\x80'
+    FILLER_NAL_SIZE = len(FILLER_NAL)
+    filler_data = FILLER_NAL * fake_count
+
+    # Read real frame sizes
     orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
     uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
     real_sizes = []
@@ -408,7 +417,7 @@ def inflate_sample_table_video(data, multiplier=5):
     for i in range(real_count):
         struct.pack_into('>I', new_stsz_body, 12 + i*4, real_sizes[i])
     for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, real_sizes[i % len(real_sizes)])
+        struct.pack_into('>I', new_stsz_body, 12 + real_count*4 + i*4, FILLER_NAL_SIZE)
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
     stts_delta = len(new_stts) - stts_sz
@@ -438,7 +447,7 @@ def inflate_sample_table_video(data, multiplier=5):
     for i in range(orig_stco_count):
         struct.pack_into('>I', new_stco_body2, 8 + i*4, stco_vals[i])
     for i in range(fake_count):
-        struct.pack_into('>I', new_stco_body2, 8 + orig_stco_count*4 + i*4, stco_vals[i % len(stco_vals)])
+        struct.pack_into('>I', new_stco_body2, 8 + orig_stco_count*4 + i*4, mdat_off + mdat_sz + i * FILLER_NAL_SIZE)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     replacements = [
@@ -469,6 +478,10 @@ def inflate_sample_table_video(data, multiplier=5):
 
     new_moov_end = moov_off + moov_sz + moov_delta
     _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
+
+    # Extend mdat with filler NALs and update mdat header
+    result.extend(filler_data)
+    struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + len(filler_data))
 
     return bytes(result)
 
@@ -685,7 +698,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None):
     # ── Pass 6: Frame Count Inflation (avcC bump + single-entry stts) ─────────
     if log_func:
         log_func("")
-        log_func("── 6/7  Frame Count Inflation (cycle real data, delta=750) ─────")
+        log_func("── 6/7  Frame Count Inflation (filler NALs in mdat, delta=750) ─────")
     inflated = inflate_sample_table_video(data, multiplier=5)
     if inflated is None:
         if log_func:
