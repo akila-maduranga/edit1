@@ -335,8 +335,7 @@ def inflate_sample_table_video(data, multiplier=5):
     new_stts_body = struct.pack('>II', 0, stts_entry_count + 1)
     for cnt, delta in stts_entries:
         new_stts_body += struct.pack('>II', cnt, delta)
-    fake_delta = max(last_delta // 10, 2)
-    new_stts_body += struct.pack('>II', fake_count, fake_delta)
+    new_stts_body += struct.pack('>II', fake_count, last_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Build stsz: all entries (real sizes + FILLER_NAL size for fake)
