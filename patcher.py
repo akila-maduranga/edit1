@@ -17,23 +17,12 @@ if __name__ == "__main__":
     p.add_argument("--comment", default=None,
                    help="\xa9cmt comment (default: auto-generated timestamped tag)")
     p.add_argument("--no-inflate", action="store_true",
-                   help="Disable frame count inflation; use brand/bitrate spoofing instead")
-    p.add_argument("--brand-only", action="store_true",
-                   help="Skip avc3, only spoof ftyp brand to M4VH")
-    p.add_argument("--minimal", action="store_true",
-                   help="Skip mvhd/udta/tkhd passes; only remux + brand + bitrate")
-    p.add_argument("--skip-udta", action="store_true",
-                   help="Skip udta strip but keep mvhd + tkhd")
-    p.add_argument("--mul", type=int, default=5,
-                   help="Inflation multiplier (default: 5, lower = less freeze)")
+                   help="Disable frame count inflation; use codec/brand spoofing instead")
     args = p.parse_args()
 
     def log(msg):
         print(msg)
 
     ok = patch_all(args.input, args.output, comment=args.comment, log_func=log,
-                   use_inflation=not args.no_inflate,
-                   brand_spoof_only=args.brand_only,
-                   minimal=args.minimal,
-                   skip_udta=args.skip_udta,
-                   multiplier=args.mul)
+                   use_inflation=not args.no_inflate)
+    sys.exit(0 if ok else 1)

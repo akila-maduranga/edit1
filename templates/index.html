@@ -268,11 +268,9 @@
     <span class="wordmark-tag">self-hosted</span>
   </div>
   <p class="subtitle">
-    Remuxes MP4 via ffmpeg stream-copy (+faststart), then runs a 9-pass binary
-    patch pipeline: edts rebuild, mvhd/tkhd fingerprints, UDTA strip, SPS/avcC
-    spoof (High10+6.2), avc1→avc3 codec, M4VH brand, NoBlur-style dummy-frame
-    inflation (multi×), and comment injection. Container durations clipped to
-    real video length to hide dummy sample tails.
+    Remuxes MP4 files via ffmpeg stream-copy (+faststart) and applies
+    a binary structural patch — rewriting <code>ftyp</code> brand and clearing
+    <code>mvhd</code> random-access flags — to bypass TikTok's re-upload compression.
   </p>
 </header>
 
@@ -289,32 +287,23 @@
     <div id="file-name"></div>
   </div>
 
-  <!-- Mode selector -->
-  <div style="display:flex;gap:10px;flex-wrap:wrap">
-    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
-      <input type="radio" name="mode" value="inflation" checked>
-      <span>Default (5× dummy frames + avc3 + M4VH + duration clip)</span>
-    </label>
-    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
-      <input type="radio" name="mode" value="no-inflate">
-      <span>No-inflate (avc3 + M4VH, 1080p only)</span>
-    </label>
-    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
-      <input type="radio" name="mode" value="brand-only">
-      <span>Brand-only (M4VH only, experimental)</span>
-    </label>
-    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
-      <input type="radio" name="mode" value="minimal">
-      <span>Minimal (M4VH + bitrate, no fingerprints)</span>
-    </label>
-  </div>
-
-  <!-- Multiplier -->
-  <div style="display:flex;align-items:center;gap:10px;font-size:12px">
-    <label for="mul-input">Multiplier:</label>
-    <input type="number" id="mul-input" value="5" min="2" max="10" step="1"
-           style="width:60px;padding:4px 8px;background:var(--surface);border:1px solid var(--border);border-radius:3px;color:var(--text);font-family:var(--mono);font-size:12px">
-    <span style="color:var(--muted)">(higher = more anti-compression, can cause freeze)</span>
+  <!-- Pipeline steps -->
+  <div class="pipeline">
+    <div class="step">
+      <div class="step-num">01</div>
+      <div class="step-title">Stream Remux</div>
+      <div class="step-desc">ffmpeg stream copy, no re-encoding. moov atom moved to front (+faststart).</div>
+    </div>
+    <div class="step">
+      <div class="step-num">02</div>
+      <div class="step-title">ftyp Patch</div>
+      <div class="step-desc">Rewrites major brand to <code>mp42</code> with canonical compatible brands list.</div>
+    </div>
+    <div class="step">
+      <div class="step-num">03</div>
+      <div class="step-title">mvhd Flag Clear</div>
+      <div class="step-desc">Clears the random-access flag bit in the movie header box.</div>
+    </div>
   </div>
 
   <!-- Run -->
@@ -412,8 +401,6 @@
     // Upload
     const fd = new FormData();
     fd.append('file', selectedFile);
-    fd.append('mode', document.querySelector('input[name="mode"]:checked')?.value || 'inflation');
-    fd.append('multiplier', document.getElementById('mul-input')?.value || '5');
     appendLog(`[JOB] uploading ${selectedFile.name}…`);
 
     let jobId;
