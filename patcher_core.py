@@ -461,10 +461,15 @@ def inflate_sample_table_video(data, multiplier=5):
         total_count = min(real_count * multiplier, 0xFFFFFFFF)
         fake_count = total_count - real_count
 
-        clean_delta = max(int(video_timescale / 60.0), 1)
-        new_stts_body = struct.pack('>II', 0, 2)
-        new_stts_body += struct.pack('>II', real_count, clean_delta)
-        new_stts_body += struct.pack('>II', fake_count, 1)
+        orig_total_dur_ticks = 0
+        for i in range(stts_entry_count):
+            off = stts_off + 16 + i * 8
+            cnt = int.from_bytes(data[off:off+4], 'big')
+            d = int.from_bytes(data[off+4:off+8], 'big')
+            orig_total_dur_ticks += cnt * d
+        proportional_delta = max(int(orig_total_dur_ticks / total_count), 1)
+        new_stts_body = struct.pack('>II', 0, 1)
+        new_stts_body += struct.pack('>II', total_count, proportional_delta)
         new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
         uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
@@ -536,7 +541,7 @@ def inflate_sample_table_video(data, multiplier=5):
         new_moov_end = moov_off + moov_sz + moov_delta
         _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-        total_stts_dur = real_count * clean_delta + fake_count * 1
+        total_stts_dur = total_count * proportional_delta
         total_sec = total_stts_dur / video_timescale
         mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
         if mvhd_off != -1:
