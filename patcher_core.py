@@ -807,7 +807,6 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         "-i", str(input_path),
         "-c", "copy",
         "-movflags", "+faststart",
-        "-metadata:s:a:0", "handler_name=SoundHandler",
         str(clean),
     ]
     if log_func:
