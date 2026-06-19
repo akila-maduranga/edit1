@@ -348,10 +348,9 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
     return result
 
 def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation by duplicating sample table entries (no filler NALs, no SPS patch).
-    Two-entry stts: real frames at original delta, fake frames at 1 tick (sequential).
-    Sequential layout: real frames first, then fake frames with filler NALs in mdat.
-    Container durations set to match total stts sum.
+    """5x inflation — fake frames share last real frame's data (no filler NALs).
+    Two-entry stts: real frames at original delta, fake frames at 1 tick.
+    Sequential layout: real frames first, then fake frames.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
@@ -407,7 +406,6 @@ def inflate_sample_table_video(data, multiplier=5):
         total_count = min(real_count * multiplier, 0xFFFFFFFF)
         fake_count = total_count - real_count
 
-        # Two-entry stts: real frames at original delta, fake frames at 1 tick (end of video)
         new_stts_body = struct.pack('>II', 0, 2)
         new_stts_body += struct.pack('>II', real_count, last_delta)
         new_stts_body += struct.pack('>II', fake_count, 1)
@@ -428,35 +426,27 @@ def inflate_sample_table_video(data, multiplier=5):
         if not real_offsets:
             return None
 
-        # Sequential: real frames first, then fake frames all pointing to last real frame
+        last_real_offset = real_offsets[-1]
+        last_real_size = real_sizes[-1]
+
         new_stsz_body = bytearray(20 + total_count * 4)
         struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
         for i in range(real_count):
             struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
-        FILLER_NAL = b'\x00\x00\x00\x01\x00'
         for i in range(fake_count):
-            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, len(FILLER_NAL))
+            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, last_real_size)
         new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
         new_stsc_body = struct.pack('>II', 0, 1)
         new_stsc_body += struct.pack('>III', 1, 1, 1)
         new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
-        filler_size = fake_count * len(FILLER_NAL)
 
-        # Find mdat data start in the original file (absolute offset)
-        mdat_box_off = data.find(b'mdat')
-        mdat_data_start = mdat_box_off + 4  # data starts 4 bytes after 'mdat' type field
-        orig_mdat_data_sz = int.from_bytes(data[mdat_box_off-4:mdat_box_off], 'big') - 8
-
-        new_stco_count = total_count
-        new_stco_body2 = bytearray(8 + new_stco_count * 4)
-        struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
+        new_stco_body2 = bytearray(8 + total_count * 4)
+        struct.pack_into('>II', new_stco_body2, 0, 0, total_count)
         for i in range(real_count):
             struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
-        # Fake frames: point to filler NALs within mdat (pre-adjust_stco offset)
         for i in range(fake_count):
-            off = mdat_data_start + orig_mdat_data_sz + i * len(FILLER_NAL)
-            struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, off)
+            struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, last_real_offset)
         new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
         replacements = [
@@ -468,10 +458,8 @@ def inflate_sample_table_video(data, multiplier=5):
         replacements.sort(key=lambda x: x[0])
 
         moov_delta = sum(len(new) - old_sz for _, old_sz, new in replacements)
-        total_delta = moov_delta + filler_size
 
-        # Build result: expanded moov + original mdat data + filler NALs
-        result = bytearray(len(data) + total_delta)
+        result = bytearray(len(data) + moov_delta)
         read_pos = 0
         write_pos = 0
         for off, old_sz, new_bytes in replacements:
@@ -480,19 +468,7 @@ def inflate_sample_table_video(data, multiplier=5):
             result[write_pos:write_pos + len(new_bytes)] = new_bytes
             write_pos += len(new_bytes)
             read_pos = off + old_sz
-        result[write_pos:write_pos + len(data) - read_pos] = data[read_pos:]
-        mdat_end_in_result = write_pos + len(data) - read_pos
-
-        # Append filler NALs after original mdat data (inside the mdat box)
-        for i in range(fake_count):
-            off = mdat_end_in_result + i * len(FILLER_NAL)
-            result[off:off+len(FILLER_NAL)] = FILLER_NAL
-
-        # Update mdat size in result header
-        mdat_box_in_data = data.find(b'mdat')
-        mdat_box_in_result = mdat_box_in_data + moov_delta
-        if mdat_box_in_result < len(result):
-            struct.pack_into('>I', result, mdat_box_in_result - 4, orig_mdat_data_sz + filler_size + 8)
+        result[write_pos:] = data[read_pos:]
 
         for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
             old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
@@ -835,7 +811,6 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         if log_func:
             log_func("")
             log_func("── 6/7  Frame Count Inflation (5x, sequential, two-entry stts) ─────────────────")
-        data = _patch_avcC_sps(data)
         inflated = inflate_sample_table_video(data, multiplier=5)
         if inflated is None:
             if log_func:
