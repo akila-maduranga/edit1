@@ -822,18 +822,12 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     stem = input_path.stem
     suffix = input_path.suffix
 
-    # Detect video resolution
+    # Detect video resolution for logging
     original_data = input_path.read_bytes()
     resolution = get_video_resolution(original_data)
     if resolution and log_func:
         width, height = resolution
         log_func(f"[RESOLUTION] {width}x{height}")
-        
-        # Skip inflation for 1080p and lower (TikTok native support)
-        if width <= 1920 and height <= 1080:
-            if log_func:
-                log_func("[INFLATION] skipped - 1080p or lower (TikTok native support)")
-            use_inflation = False
 
     if comment is None or comment == "@akila":
         ts = int(time.time())
