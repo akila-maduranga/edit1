@@ -511,25 +511,24 @@ def inflate_sample_table_video(data, multiplier=5):
         total_sec = total_stts_dur / 90000.0
         mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
         if mvhd_off != -1:
-            ver = result[mvhd_off+12]
+            ver = result[mvhd_off+8]
             if ver == 0:
-                mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
-                old_dur = int.from_bytes(result[mvhd_off+28:mvhd_off+32], 'big')
+                mvhd_ts = int.from_bytes(result[mvhd_off+20:mvhd_off+24], 'big')
+                old_dur = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
                 mvhd_dur = min(int(total_sec * mvhd_ts), 0xFFFFFFFF)
                 mvhd_dur = max(mvhd_dur, old_dur)
-                result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
+                result[mvhd_off+24:mvhd_off+28] = struct.pack('>I', mvhd_dur)
             else:
-                mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
-                old_dur = int.from_bytes(result[mvhd_off+36:mvhd_off+44], 'big')
+                mvhd_ts = int.from_bytes(result[mvhd_off+28:mvhd_off+32], 'big')
+                old_dur = int.from_bytes(result[mvhd_off+32:mvhd_off+40], 'big')
                 mvhd_dur = int(total_sec * mvhd_ts)
                 mvhd_dur = max(mvhd_dur, old_dur)
-                result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
+                result[mvhd_off+32:mvhd_off+40] = struct.pack('>Q', mvhd_dur)
 
         trak_dur = 0
         if 'mvhd_ts' in dir():
             trak_dur = min(int(total_sec * mvhd_ts), 0xFFFFFFFF)
         for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
-            # Only update video track durations
             mdia_off_v, mdia_sz_v = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
             is_video = False
             if mdia_off_v != -1:
@@ -541,25 +540,25 @@ def inflate_sample_table_video(data, multiplier=5):
 
             tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
             if tkhd_off != -1:
-                ver = result[tkhd_off+12]
+                ver = result[tkhd_off+8]
                 if ver == 0:
-                    result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', trak_dur)
+                    result[tkhd_off+28:tkhd_off+32] = struct.pack('>I', trak_dur)
                 else:
-                    result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', trak_dur)
+                    result[tkhd_off+36:tkhd_off+44] = struct.pack('>Q', trak_dur)
 
             mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
             if mdia_off != -1:
                 mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
                 if mdhd_off != -1:
-                    ver = result[mdhd_off+12]
+                    ver = result[mdhd_off+8]
                     if ver == 0:
-                        mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
+                        mdhd_ts = int.from_bytes(result[mdhd_off+20:mdhd_off+24], 'big')
                         mdhd_dur = min(int(total_sec * mdhd_ts), 0xFFFFFFFF)
-                        result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
+                        result[mdhd_off+24:mdhd_off+28] = struct.pack('>I', mdhd_dur)
                     else:
-                        mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
+                        mdhd_ts = int.from_bytes(result[mdhd_off+28:mdhd_off+32], 'big')
                         mdhd_dur = int(total_sec * mdhd_ts)
-                        result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
+                        result[mdhd_off+32:mdhd_off+40] = struct.pack('>Q', mdhd_dur)
 
         return bytes(result)
     except (struct.error, ValueError, OverflowError, RuntimeError) as _exc:
