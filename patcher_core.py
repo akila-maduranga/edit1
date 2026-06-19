@@ -889,9 +889,55 @@ def get_video_resolution(data):
     return None
 
 
+# ── Move moov to end ─────────────────────────────────────────────────────
+
+def move_moov_to_end(data):
+    """Move moov atom to end of file (non-faststart).
+    TikTok's uploader is known to handle non-faststart files better for this exploit.
+    """
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+
+    mdat_off, mdat_sz = _find_box(data, b"mdat")
+    if mdat_off == -1:
+        return data
+
+    # Check if moov is already at end
+    if moov_off > mdat_off:
+        return data
+
+    # Reorder: ftyp -> mdat -> moov
+    ftyp_off, ftyp_sz = _find_box(data, b"ftyp")
+    if ftyp_off == -1:
+        return data
+
+    # Build new file structure
+    new_data = bytearray(len(data))
+    pos = 0
+
+    # Copy ftyp
+    new_data[pos:pos+ftyp_sz] = data[ftyp_off:ftyp_off+ftyp_sz]
+    pos += ftyp_sz
+
+    # Copy mdat
+    new_data[pos:pos+mdat_sz] = data[mdat_off:mdat_off+mdat_sz]
+    pos += mdat_sz
+
+    # Copy moov
+    new_data[pos:pos+moov_sz] = data[moov_off:moov_off+moov_sz]
+    pos += moov_sz
+
+    # Copy any remaining atoms after moov
+    if moov_off + moov_sz < len(data):
+        new_data[pos:] = data[moov_off+moov_sz:]
+
+    return bytes(new_data)
+
+
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
@@ -1017,6 +1063,14 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     data = inject_comment_udta(data, comment)
     if log_func:
         log_func("[COMMENT] injected")
+
+    # ── Pass 8: Move moov to end (non-faststart) ─────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 8/8  Move moov to end (non-faststart) ───────────────────────")
+    data = move_moov_to_end(data)
+    if log_func:
+        log_func("[MOOV] moved to end")
 
     # Restore original audio duration
     if original_audio_dur is not None:
