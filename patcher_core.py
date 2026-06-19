@@ -316,11 +316,12 @@ def _nal_to_nonref(frame_bytes, length_size):
         return frame_bytes
     nalu_start = length_size
     orig_header = frame_bytes[nalu_start]
-    # Clear bits 6-5 (nal_ref_idc), keep forbidden(bit7) and type(bits4-0)
-    new_header = orig_header & 0x80  # keep forbidden bit only
-    # Set nal_unit_type=1 (non-IDR slice). If it was already non-VCL
-    # (AUD/SEI etc.) the type change is harmless since nal_ref_idc=0.
-    new_header |= 0x01
+    nal_unit_type = orig_header & 0x1F
+    # Clear nal_ref_idc (bits 6-5), preserve forbidden (bit 7) and type (bits 4-0)
+    new_header = orig_header & 0x9F
+    # IDR (type 5) with nal_ref_idc=0 is invalid — change to non-IDR slice (type 1)
+    if nal_unit_type == 5:
+        new_header = (new_header & 0xE0) | 0x01
     result = bytearray(frame_bytes)
     result[nalu_start] = new_header
     return bytes(result)
@@ -376,6 +377,17 @@ def inflate_sample_table_video(data, multiplier=3):
     stsc_off, stsc_sz = _find_box(data, b"stsc", stbl_off+8, stbl_end)
     if -1 in (stts_off, stsz_off, stco_off, stsc_off):
         return None
+
+    # Read video mdhd timescale (stts deltas are in these units)
+    mdia_sz_v = int.from_bytes(data[mdia_off:mdia_off+4], 'big')
+    mdhd_off_v, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz_v)
+    video_timescale = 90000
+    if mdhd_off_v != -1:
+        mdhd_v_ver = data[mdhd_off_v+8]
+        if mdhd_v_ver == 0:
+            video_timescale = int.from_bytes(data[mdhd_off_v+20:mdhd_off_v+24], 'big')
+        else:
+            video_timescale = int.from_bytes(data[mdhd_off_v+28:mdhd_off_v+32], 'big')
 
     # Read real frame count and delta
     stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
@@ -506,41 +518,41 @@ def inflate_sample_table_video(data, multiplier=3):
 
     # Update durations
     total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
-    total_sec = total_stts_dur / 90000.0
+    total_sec = total_stts_dur / float(video_timescale)
     mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, new_moov_end)
     if mvhd_off != -1:
-        ver = result[mvhd_off+12]
+        ver = result[mvhd_off+8]
         if ver == 0:
-            mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
+            mvhd_ts = int.from_bytes(result[mvhd_off+20:mvhd_off+24], 'big')
             mvhd_dur = int(total_sec * mvhd_ts)
-            result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
+            result[mvhd_off+24:mvhd_off+28] = struct.pack('>I', mvhd_dur)
         else:
-            mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
+            mvhd_ts = int.from_bytes(result[mvhd_off+28:mvhd_off+32], 'big')
             mvhd_dur = int(total_sec * mvhd_ts)
-            result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
+            result[mvhd_off+32:mvhd_off+40] = struct.pack('>Q', mvhd_dur)
 
     for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, new_moov_end):
         tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
         if tkhd_off != -1:
-            ver = result[tkhd_off+12]
+            ver = result[tkhd_off+8]
             if ver == 0:
-                result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', mvhd_dur)
+                result[tkhd_off+28:tkhd_off+32] = struct.pack('>I', mvhd_dur)
             else:
-                result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', mvhd_dur)
+                result[tkhd_off+40:tkhd_off+48] = struct.pack('>Q', mvhd_dur)
 
         mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
         if mdia_off != -1:
             mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
             if mdhd_off != -1:
-                ver = result[mdhd_off+12]
+                ver = result[mdhd_off+8]
                 if ver == 0:
-                    mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
+                    mdhd_ts = int.from_bytes(result[mdhd_off+20:mdhd_off+24], 'big')
                     mdhd_dur = int(total_sec * mdhd_ts)
-                    result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
+                    result[mdhd_off+24:mdhd_off+28] = struct.pack('>I', mdhd_dur)
                 else:
-                    mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
+                    mdhd_ts = int.from_bytes(result[mdhd_off+28:mdhd_off+32], 'big')
                     mdhd_dur = int(total_sec * mdhd_ts)
-                    result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
+                    result[mdhd_off+32:mdhd_off+40] = struct.pack('>Q', mdhd_dur)
 
     return bytes(result)
 
