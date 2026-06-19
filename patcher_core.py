@@ -770,6 +770,47 @@ def patch_stsd_codec(data):
     return bytes(result)
 
 
+# ── Video Resolution Detection ─────────────────────────────────────────
+
+def get_video_resolution(data):
+    """Extract video resolution from MP4 metadata."""
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return None
+    
+    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        
+        hdlr_off, hdlr_sz = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1:
+            continue
+        
+        # Check if this is a video track
+        if data[hdlr_off+16:hdlr_off+20] != b'vide':
+            continue
+        
+        # Find tkhd to get dimensions
+        tkhd_off, tkhd_sz = _find_box(data, b"tkhd", trak_off+8, trak_off+trak_sz)
+        if tkhd_off == -1:
+            continue
+        
+        version = data[tkhd_off+12]
+        if version == 0:
+            # 32-bit values
+            width = int.from_bytes(data[tkhd_off+40:tkhd_off+44], 'big') >> 16
+            height = int.from_bytes(data[tkhd_off+44:tkhd_off+48], 'big') >> 16
+        else:
+            # 64-bit values
+            width = int.from_bytes(data[tkhd_off+52:tkhd_off+56], 'big') >> 16
+            height = int.from_bytes(data[tkhd_off+56:tkhd_off+60], 'big') >> 16
+        
+        return (width, height)
+    
+    return None
+
+
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
 def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
@@ -781,12 +822,24 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     stem = input_path.stem
     suffix = input_path.suffix
 
+    # Detect video resolution
+    original_data = input_path.read_bytes()
+    resolution = get_video_resolution(original_data)
+    if resolution and log_func:
+        width, height = resolution
+        log_func(f"[RESOLUTION] {width}x{height}")
+        
+        # Skip inflation for 1080p and lower (TikTok native support)
+        if width <= 1920 and height <= 1080:
+            if log_func:
+                log_func("[INFLATION] skipped - 1080p or lower (TikTok native support)")
+            use_inflation = False
+
     if comment is None or comment == "@akila":
         ts = int(time.time())
         tag = f"{ts}_{random.randint(0, 0xFFFFFFFF):08x}"
         comment = f"Patched by method.akila - {tag}"
 
-    original_data = input_path.read_bytes()
     original_audio_dur = read_audio_duration(original_data)
     if log_func and original_audio_dur is not None:
         log_func(f"[AUDIO] original duration={original_audio_dur}")
