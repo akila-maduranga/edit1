@@ -5,10 +5,10 @@ Core patching engine — TikTok bypass with fingerprint-based re-encode preventi
 Pipeline:
    1. FFmpeg remux (Faststart, normalize)
    2. ZeroLoss Track Bypass (edts/elst rebuild)
-   3. mvhd Fingerprint (next_track_id = 9999, fixed creation date)
+   3. mvhd Fingerprint (zero dates)
    4. Udta Strip (remove ffmpeg encoder signature)
-    5. Tkhd Fingerprint (alternate_group, preserve original orientation)
-   6. Frame Count Inflation (5x, duplicate sample table entries, no filler NALs, avcC/SPS)
+   5. Tkhd Fingerprint (zero alternate_group)
+   6. Frame Count Inflation (5x, two-entry stts, no filler NALs)
    7. Comment Udta Injection (Apple iTunes-style only)
    8. Restore original audio duration
 """
@@ -134,8 +134,6 @@ def rebuild_elst_bypass(data):
             v = data[mdhd_off+8]
             ts_off = mdhd_off + (24 if v == 0 else 32)
             timescale = int.from_bytes(data[ts_off:ts_off+4], 'big')
-            if timescale == 90000:
-                media_time = 6000
 
         edts_bytes = build_edts_atom(duration, media_time)
         edts_off, edts_sz = _find_box(data, b"edts", trak_off+8, trak_off+trak_sz)
@@ -181,9 +179,7 @@ def rebuild_elst_bypass(data):
 # ── Subtle mvhd fingerprint ─────────────────────────────────────────
 
 def patch_mvhd_fingerprint(data):
-    """Change mvhd.next_track_id to a large value + set a fixed creation time.
-    Alters the file's hash/signature without introducing suspicious matrix values.
-    """
+    """Zero out mvhd dates to match TikTok source style; keep original next_track_id."""
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
@@ -194,18 +190,10 @@ def patch_mvhd_fingerprint(data):
     version = p[mvhd_off+8]
     if version == 0:
         ct_off = mvhd_off + 12
-        dur_off = mvhd_off + 24
-        nti_off = mvhd_off + 84
     else:
         ct_off = mvhd_off + 20
-        dur_off = mvhd_off + 32
-        nti_off = mvhd_off + 96
-    rand_ts = random.randint(1_600_000_000, 1_750_000_000)
     if ct_off + 8 <= len(p):
-        struct.pack_into('>II', p, ct_off, rand_ts, rand_ts)
-    rand_nti = random.randint(100, 9998)
-    if nti_off + 4 <= len(p):
-        struct.pack_into('>I', p, nti_off, rand_nti)
+        struct.pack_into('>II', p, ct_off, 0, 0)
     return bytes(p)
 
 
@@ -229,14 +217,11 @@ def strip_udta(data):
 # ── Tkhd fingerprint ──────────────────────────────────────────────────
 
 def fingerprint_tkhd(data):
-    """Set alternate_group for fingerprinting while preserving original tkhd
-    matrix (rotation/orientation from the original encoder).
-    """
+    """Zero out tkhd alternate_group to match TikTok source style."""
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
     p = bytearray(data)
-    group_id = 1
     for trak_off, trak_sz, _ in _iter_boxes(p, moov_off+8, moov_off+moov_sz):
         tkhd_off, _ = _find_box(p, b"tkhd", trak_off+8, trak_off+trak_sz)
         if tkhd_off == -1:
@@ -249,8 +234,7 @@ def fingerprint_tkhd(data):
         else:
             continue
         if group_off + 2 <= len(p):
-            struct.pack_into('>H', p, group_off, group_id)
-            group_id += 1
+            struct.pack_into('>H', p, group_off, 0)
     return bytes(p)
 
 
@@ -490,14 +474,28 @@ def inflate_sample_table_video(data, multiplier=5):
             ver = result[mvhd_off+12]
             if ver == 0:
                 mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
+                old_dur = int.from_bytes(result[mvhd_off+28:mvhd_off+32], 'big')
                 mvhd_dur = min(int(total_sec * mvhd_ts), 0xFFFFFFFF)
+                mvhd_dur = max(mvhd_dur, old_dur)
                 result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
             else:
                 mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
+                old_dur = int.from_bytes(result[mvhd_off+36:mvhd_off+44], 'big')
                 mvhd_dur = int(total_sec * mvhd_ts)
+                mvhd_dur = max(mvhd_dur, old_dur)
                 result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
 
         for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
+            # Only update video track durations
+            mdia_off_v, mdia_sz_v = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
+            is_video = False
+            if mdia_off_v != -1:
+                hdlr_off, _ = _find_box(result, b"hdlr", mdia_off_v+8, mdia_off_v+mdia_sz_v)
+                if hdlr_off != -1 and result[hdlr_off+16:hdlr_off+20] == b'vide':
+                    is_video = True
+            if not is_video:
+                continue
+
             tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
             if tkhd_off != -1:
                 ver = result[tkhd_off+12]
@@ -797,7 +795,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         # ── Pass 6a: Frame Count Inflation ────────────────────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Frame Count Inflation (5x, duplicate entries, proportional stts) ─────")
+            log_func("── 6/7  Frame Count Inflation (5x, two-entry stts, no filler NALs) ─────────────")
         inflated = inflate_sample_table_video(data, multiplier=5)
         if inflated is None:
             if log_func:
