@@ -379,13 +379,13 @@ def inflate_sample_table_video(data, multiplier=10):
     ctts_idx = 0
     for i in range(real_count):
         # Real frame has offset 0
-        new_ctts_body += struct.pack('>II', 1, 0)
+        new_ctts_body += struct.pack('>Ii', 1, 0)  # Use signed integer for offset
         ctts_idx += 1
         # Fake frames have negative offsets to compress timeline
         for j in range(multiplier - 1):
             # Offset = -(j+1) * last_delta to make fake frames display at same time as real frame
             offset = -(j + 1) * last_delta
-            new_ctts_body += struct.pack('>II', 1, offset)
+            new_ctts_body += struct.pack('>Ii', 1, offset)  # Use signed integer for offset
             ctts_idx += 1
     new_ctts = struct.pack('>I4s', 8 + len(new_ctts_body), b'ctts') + new_ctts_body
 
