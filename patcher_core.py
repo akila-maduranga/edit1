@@ -257,8 +257,8 @@ def fingerprint_tkhd(data):
 # ── Frame Inflation (two-entry stts + cycle real data + avcC/SPS) ──────
 
 def _patch_avcC_sps(data):
-    """Patch avcC AND SPS profile to High10, level to 6.2.
-    TikTok may parse the SPS for actual codec info.
+    """Patch avcC AND SPS profile to High10, level to 5.1 (standard).
+    Reverted from 6.2 to avoid decoder compatibility issues.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
@@ -295,12 +295,12 @@ def _patch_avcC_sps(data):
                 # avcC level + profile
                 p[avcC_off+9] = 110   # profile: High → High10
                 p[avcC_off+10] = 0    # profile_compat
-                p[avcC_off+11] = 62   # level: 5.1 → 6.2
+                p[avcC_off+11] = 51   # level: 5.1 (standard, reverted from 6.2)
                 # SPS NAL is at avcC_off + 16 (after config header)
                 sps_start = avcC_off + 16
                 if sps_start + 3 < len(p):
                     p[sps_start+1] = 110  # SPS profile_idc
-                    p[sps_start+3] = 62   # SPS level_idc
+                    p[sps_start+3] = 51   # SPS level_idc (5.1)
                 return bytes(p)
             pos += e_sz
     return data
@@ -414,10 +414,16 @@ def inflate_sample_table_video(data, multiplier=5):
     new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-    # Find mdat for offset calculation
+    # Find mdat for filler NAL placement
     mdat_off, mdat_sz = _find_box(data, b"mdat")
     if mdat_off == -1:
         return None
+
+    FILLER_NAL = b'\x00\x00\x00\x01\x0c\x80'  # valid H.264 filler NAL
+    FILLER_NAL_SIZE = 512  # pad to 512 bytes to mimic realistic frame size
+    filler_frame = FILLER_NAL + b'\x00' * (FILLER_NAL_SIZE - len(FILLER_NAL))
+    filler_data = filler_frame * fake_count
+    filler_total = len(filler_data)
 
     # Read real frame sizes
     orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
@@ -435,32 +441,13 @@ def inflate_sample_table_video(data, multiplier=5):
     if not real_offsets:
         return None
 
-    # Non-interleaved stsz: all real, then fake frames use IDR frame sizes
-    # Get IDR frame sizes corresponding to IDR offsets
-    idr_offsets = get_idr_frame_offsets(data)
-    if not idr_offsets:
-        # Fallback: use last real frame size
-        filler_sizes = [real_sizes[-1]] * fake_count
-    else:
-        # Get sizes for IDR frames by matching offsets
-        filler_sizes = []
-        for i in range(fake_count):
-            idr_offset = idr_offsets[i % len(idr_offsets)]
-            # Find the size corresponding to this offset
-            for j, offset in enumerate(real_offsets):
-                if offset == idr_offset and j < len(real_sizes):
-                    filler_sizes.append(real_sizes[j])
-                    break
-            else:
-                # Fallback to last real frame size if no match
-                filler_sizes.append(real_sizes[-1])
-
+    # Non-interleaved stsz: all real, then fake frames use FILLER_NAL_SIZE
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     for i in range(real_count):
         struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
     for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, filler_sizes[i])
+        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, FILLER_NAL_SIZE)
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
     # stsc: all chunks have 1 sample (simpler approach)
@@ -475,25 +462,17 @@ def inflate_sample_table_video(data, multiplier=5):
     stsc_delta = len(new_stsc) - stsc_sz
     moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
 
-    # Non-interleaved stco: all real offsets, then fake frames point to IDR frames
-    # Get IDR frame offsets (for filler frames)
-    idr_offsets = get_idr_frame_offsets(data)
-    if not idr_offsets:
-        # Fallback: use last real frame (original behaviour)
-        filler_offsets = [real_offsets[-1]] * fake_count
-    else:
-        # Cycle through available IDR frames
-        filler_offsets = []
-        for i in range(fake_count):
-            filler_offsets.append(idr_offsets[i % len(idr_offsets)])
-
+    # Non-interleaved stco: all real offsets, then fake frames point to filler NALs
+    # Filler NALs will be appended at end of mdat
+    safe_offset = mdat_off + mdat_sz  # End of original mdat
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     for i in range(real_count):
         struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i] + moov_delta)
     for i in range(fake_count):
-        # Point fake frames to IDR frames (keyframes that can be decoded independently)
-        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, filler_offsets[i] + moov_delta)
+        # Point fake frames to filler NALs at end of mdat
+        pos = safe_offset + moov_delta + i * FILLER_NAL_SIZE
+        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     replacements = [
@@ -504,7 +483,7 @@ def inflate_sample_table_video(data, multiplier=5):
     ]
     replacements.sort(key=lambda x: x[0])
 
-    new_size = len(data) + moov_delta
+    new_size = len(data) + moov_delta + filler_total
     result = bytearray(new_size)
 
     read_pos = 0
@@ -539,6 +518,11 @@ def inflate_sample_table_video(data, multiplier=5):
             offset_off = video_stco_off + 16 + i * 4
             current_offset = int.from_bytes(result[offset_off:offset_off+4], 'big')
             struct.pack_into('>I', result, offset_off, current_offset - moov_delta)
+
+    # Append filler data at end of mdat
+    mdat_content_end = mdat_off + moov_delta + mdat_sz
+    result[mdat_content_end:mdat_content_end + filler_total] = filler_data
+    struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + filler_total)
 
     # Keep container durations consistent with stts total duration
     # stts total duration = (real_count * last_delta) + (fake_count * fake_delta)
@@ -966,12 +950,13 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         _dump_atoms(data, "REBASE", log_func)
 
     # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ────────────────
-    if log_func:
-        log_func("")
-        log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
-    data = rebuild_elst_bypass(data)
-    if log_func:
-        log_func("[ELST] done")
+    # SKIPPED: edts/elst modifications might confuse TikTok's uploader
+    # if log_func:
+    #     log_func("")
+    #     log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
+    # data = rebuild_elst_bypass(data)
+    # if log_func:
+    #     log_func("[ELST] done")
 
     # ── Pass 3: Subtle mvhd fingerprint ──────────────────────────────
     if log_func:
