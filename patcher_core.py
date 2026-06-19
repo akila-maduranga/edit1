@@ -8,7 +8,7 @@ Pipeline:
    3. mvhd Fingerprint (zero dates)
    4. Udta Strip (remove ffmpeg encoder signature)
    5. Tkhd Fingerprint (zero alternate_group)
-   6. Frame Count Inflation (5x, multi-entry stts, interleaved, no filler NALs)
+   6. Frame Count Inflation (5x, sequential, two-entry stts, no filler NALs)
    7. Comment Udta Injection (Apple iTunes-style only)
    8. Restore original audio duration
 """
@@ -361,8 +361,8 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
 
 def inflate_sample_table_video(data, multiplier=5):
     """5x inflation by duplicating sample table entries (no filler NALs, no SPS patch).
-    Multi-entry stts: real frames at original delta, fake interleaved copies at 1 tick.
-    Interleaved layout: each real frame followed by multiplier-1 duplicates.
+    Two-entry stts: real frames at original delta, fake frames at 1 tick (sequential).
+    Sequential layout: real frames first, then fake frames pointing to last real frame.
     Container durations set to match total stts sum.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
@@ -419,11 +419,10 @@ def inflate_sample_table_video(data, multiplier=5):
         total_count = min(real_count * multiplier, 0xFFFFFFFF)
         fake_count = total_count - real_count
 
-        # Multi-entry stts: each group = 1 real frame at original delta + (multiplier-1) fake at 1 tick
-        new_stts_body = struct.pack('>II', 0, real_count * 2)
-        for _ in range(real_count):
-            new_stts_body += struct.pack('>II', 1, last_delta)
-            new_stts_body += struct.pack('>II', multiplier - 1, 1)
+        # Two-entry stts: real frames at original delta, fake frames at 1 tick (end of video)
+        new_stts_body = struct.pack('>II', 0, 2)
+        new_stts_body += struct.pack('>II', real_count, last_delta)
+        new_stts_body += struct.pack('>II', fake_count, 1)
         new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
         uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
@@ -441,14 +440,14 @@ def inflate_sample_table_video(data, multiplier=5):
         if not real_offsets:
             return None
 
-        # Interleaved: each real frame followed by multiplier-1 copies
+        # Sequential: real frames first, then fake frames all pointing to last real frame
         new_stsz_body = bytearray(20 + total_count * 4)
         struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
-        idx = 0
         for i in range(real_count):
-            for _ in range(multiplier):
-                struct.pack_into('>I', new_stsz_body, 12 + idx * 4, real_sizes[i])
-                idx += 1
+            struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
+        last_size = real_sizes[-1]
+        for i in range(fake_count):
+            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, last_size)
         new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
         new_stsc_body = struct.pack('>II', 0, 1)
@@ -458,11 +457,11 @@ def inflate_sample_table_video(data, multiplier=5):
         new_stco_count = total_count
         new_stco_body2 = bytearray(8 + new_stco_count * 4)
         struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
-        idx = 0
         for i in range(real_count):
-            for _ in range(multiplier):
-                struct.pack_into('>I', new_stco_body2, 8 + idx * 4, real_offsets[i])
-                idx += 1
+            struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
+        last_off = real_offsets[-1]
+        for i in range(fake_count):
+            struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, last_off)
         new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
         replacements = [
@@ -496,7 +495,7 @@ def inflate_sample_table_video(data, multiplier=5):
         new_moov_end = moov_off + moov_sz + moov_delta
         _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-        total_stts_dur = real_count * (last_delta + (multiplier - 1) * 1)
+        total_stts_dur = real_count * last_delta + fake_count * 1
         total_sec = total_stts_dur / 90000.0
         mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
         if mvhd_off != -1:
@@ -835,7 +834,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         # ── Pass 6a: Frame Count Inflation ────────────────────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Frame Count Inflation (5x, multi-entry stts, interleaved) ─────────────────")
+            log_func("── 6/7  Frame Count Inflation (5x, sequential, two-entry stts) ─────────────────")
         inflated = inflate_sample_table_video(data, multiplier=5)
         if inflated is None:
             if log_func:
