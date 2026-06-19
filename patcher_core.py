@@ -345,8 +345,8 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=1.2):
-    """1.2x inflation with filler NALs (very subtle).
+def inflate_sample_table_video(data, multiplier=2):
+    """2x inflation with filler NALs (middle ground).
     Real frames at original delta, fake frames at delta=1.
     Filler NALs appended at end of mdat.
     """
@@ -406,12 +406,12 @@ def inflate_sample_table_video(data, multiplier=1.2):
     orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
     total_count = real_count * multiplier
     fake_count = total_count - real_count
-    fake_delta = 1  # Very small delta for subtle inflation
 
-    # Two-entry stts: real frames at original delta, fake frames at delta=1
-    new_stts_body = struct.pack('>II', 0, 2)
-    new_stts_body += struct.pack('>II', real_count, last_delta)
-    new_stts_body += struct.pack('>II', fake_count, fake_delta)
+    # Single-entry stts: distribute total duration across all frames
+    # This preserves exact total duration while inflating frame count
+    new_delta = total_ticks // total_count
+    new_stts_body = struct.pack('>II', 0, 1)
+    new_stts_body += struct.pack('>II', total_count, new_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Find mdat for filler NAL placement
