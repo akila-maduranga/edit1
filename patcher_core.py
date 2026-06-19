@@ -1032,12 +1032,13 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         log_func("[COMMENT] injected")
 
     # ── Pass 8: Move moov to end (non-faststart) ─────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 8/8  Move moov to end (non-faststart) ───────────────────────")
-    data = move_moov_to_end(data)
-    if log_func:
-        log_func("[MOOV] moved to end")
+    # SKIPPED: Non-faststart files are unplayable until fully downloaded
+    # if log_func:
+    #     log_func("")
+    #     log_func("── 8/8  Move moov to end (non-faststart) ───────────────────────")
+    # data = move_moov_to_end(data)
+    # if log_func:
+    #     log_func("[MOOV] moved to end")
 
     # Restore original audio duration
     if original_audio_dur is not None:
