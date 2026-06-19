@@ -825,61 +825,11 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         log_func(f"[READ] {len(data):,} bytes")
         _dump_atoms(data, "REBASE", log_func)
 
-    # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ────────────────
-    if log_func:
-        log_func("")
-        log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
-    data = rebuild_elst_bypass(data)
-    if log_func:
-        log_func("[ELST] done")
-
-    # ── Pass 3: Subtle mvhd fingerprint ──────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 3/7  mvhd Fingerprint (next_track_id + date) ───────────")
-    data = patch_mvhd_fingerprint(data)
-    if log_func:
-        log_func("[MVHD] done")
-
-    # ── Pass 4: Udta Strip ──────────────────────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 4/7  Udta Strip ──────────────────────────────────────────")
-    before_sz = len(data)
-    data = strip_udta(data)
-    stripped = before_sz - len(data)
-    if log_func:
-        log_func(f"[UDTA] stripped {stripped} bytes" if stripped else "[UDTA] none found")
-
-    # ── Pass 5: Tkhd fingerprint ────────────────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 5/8  Tkhd Fingerprint (alternate_group, preserve orientation) ──")
-    data = fingerprint_tkhd(data)
-    if log_func:
-        log_func("[TKHD] done")
-
-    # ── Pass 6: Normalize frame rate to clean 60fps ────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 6/8  Frame Rate Normalize (→ 60fps) ──────────────────────")
-    data = normalize_frame_rate(data, target_fps=60.0)
-    if log_func:
-        log_func("[FPS] normalized")
-
-    # ── Pass 7: Strip HDR color metadata ──────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 7/8  Color Metadata (colr → BT.709) ──────────────────────")
-    data = patch_color_metadata(data)
-    if log_func:
-        log_func("[COLOR] patched")
-
     if use_inflation:
-        # ── Pass 8a: Frame Count Inflation ────────────────────────────
+        # ── Pass 2a: Frame Count Inflation (minimal — only remux + inflate) ──
         if log_func:
             log_func("")
-            log_func("── 8/8  Frame Count Inflation (5x, 60fps, sequential, two-entry stts) ──────────")
+            log_func("── 2/2  Frame Count Inflation (5x, sequential, two-entry stts) ────────────────")
         inflated = inflate_sample_table_video(data, multiplier=5)
         if inflated is None:
             if log_func:
@@ -891,34 +841,14 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         if log_func:
             log_func("[INFLATE] done")
     else:
-        # ── Pass 8b: Codec + Brand Spoofing ───────────────────────────
+        # ── Pass 2b: Codec + Brand Spoofing ───────────────────────────
         if log_func:
             log_func("")
-            log_func("── 8/8  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
+            log_func("── 2/2  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
         data = patch_stsd_codec(data)
         data = patch_ftyp(data)
         if log_func:
             log_func("[CODEC] done")
-    
-    # ── Comment Udta Injection (optional pass 9) ─────────────────────────
-    if inject_comment:
-        if log_func:
-            log_func("")
-            log_func("── 9/9  Comment Udta Injection ─────────────────────────────")
-        data = inject_comment_udta(data, comment)
-        if log_func:
-            log_func("[COMMENT] injected")
-    else:
-        if log_func:
-            log_func("[COMMENT] skipped (no custom comment provided)")
-
-    # Restore original audio duration
-    if original_audio_dur is not None:
-        fixed = patch_audio_duration(data, original_audio_dur)
-        if fixed is not None:
-            data = fixed
-            if log_func:
-                log_func(f"[AUDIO] restored duration to {original_audio_dur}")
 
     # Final verify
     if log_func:
