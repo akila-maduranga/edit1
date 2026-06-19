@@ -433,17 +433,14 @@ def inflate_sample_table_video(data, multiplier=5):
         struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
         for i in range(real_count):
             struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
-        last_size = real_sizes[-1]
+        FILLER_NAL = b'\x00\x00\x00\x01\x00'
         for i in range(fake_count):
-            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, last_size)
+            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, len(FILLER_NAL))
         new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
         new_stsc_body = struct.pack('>II', 0, 1)
         new_stsc_body += struct.pack('>III', 1, 1, 1)
         new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
-
-        # Filler NAL for each fake frame: \x00\x00\x00\x01\x00 (5 bytes, valid H.264)
-        FILLER_NAL = b'\x00\x00\x00\x01\x00'
         filler_size = fake_count * len(FILLER_NAL)
 
         # Find mdat data start in the original file (absolute offset)
