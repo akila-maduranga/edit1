@@ -18,6 +18,11 @@ import subprocess
 import time
 import random
 from pathlib import Path
+try:
+    from tiktok_quality import patch as tiktok_patch
+    TIKTOK_QUALITY_AVAILABLE = True
+except ImportError:
+    TIKTOK_QUALITY_AVAILABLE = False
 
 _SCRIPT_DIR = Path(__file__).parent
 
@@ -973,8 +978,9 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         # ── Pass 6a: Frame Count Inflation ────────────────────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Frame Count Inflation (5x, non-interleaved, duration clip) ─────")
-        inflated = inflate_sample_table_video(data, multiplier=5)
+            log_func("── 6/7  Frame Count Inflation (1.5x, custom) ─────")
+        # Use custom inflation (tiktok-quality requires virtual environment)
+        inflated = inflate_sample_table_video(data, multiplier=1.5)
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
