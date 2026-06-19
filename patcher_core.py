@@ -525,9 +525,8 @@ def inflate_sample_table_video(data, multiplier=2):
     struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + filler_total)
 
     # Keep container durations consistent with stts total duration
-    # stts total duration = (real_count * last_delta) + (fake_count * fake_delta)
-    # This prevents freeze by ensuring timing consistency
-    total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
+    # With single-entry stts, total duration = total_count * new_delta
+    total_stts_dur = total_count * new_delta
     total_sec = total_stts_dur / 90000.0
     mvhd_dur = int(total_sec * 1000)
     mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
