@@ -302,9 +302,10 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation by duplicating sample table entries (no filler NALs).
+def inflate_sample_table_video(data, multiplier=2):
+    """2x inflation by duplicating sample table entries (no filler NALs).
     Uses single-entry stts where all deltas are multiplied by multiplier.
+    Reduced from 5x to avoid delta overflow.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
@@ -337,6 +338,7 @@ def inflate_sample_table_video(data, multiplier=5):
     stsz_off, stsz_sz = _find_box(data, b"stsz", stbl_off+8, stbl_end)
     stco_off, stco_sz = _find_box(data, b"stco", stbl_off+8, stbl_end)
     stsc_off, stsc_sz = _find_box(data, b"stsc", stbl_off+8, stbl_end)
+    ctts_off, ctts_sz = _find_box(data, b"ctts", stbl_off+8, stbl_end)
 
     if -1 in (stts_off, stsz_off, stco_off, stsc_off):
         return None
@@ -358,14 +360,20 @@ def inflate_sample_table_video(data, multiplier=5):
     orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
     total_count = real_count * multiplier
     fake_count = total_count - real_count
-    fake_delta = 1  # Small delta for fake frames
 
-    # Two-entry stts: real frames at original delta, fake frames at delta=1
-    # Avoids integer overflow from proportional delta multiplication
-    new_stts_body = struct.pack('>II', 0, 2)
-    new_stts_body += struct.pack('>II', real_count, last_delta)
-    new_stts_body += struct.pack('>II', fake_count, fake_delta)
+    # Single-entry stts with proportional delta (like tiktok-quality)
+    # Use ctts to handle composition time offsets for fake frames
+    new_delta = last_delta * multiplier
+    new_stts_body = struct.pack('>II', 0, 1)
+    new_stts_body += struct.pack('>II', total_count, new_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
+
+    # Build ctts: real frames have offset 0, fake frames have negative offsets
+    # This keeps composition time correct while using proportional deltas
+    new_ctts_body = struct.pack('>II', 0, 1)
+    # All frames have composition offset 0 (decode time is handled by stts)
+    new_ctts_body += struct.pack('>II', total_count, 0)
+    new_ctts = struct.pack('>I4s', 8 + len(new_ctts_body), b'ctts') + new_ctts_body
 
     # Read real frame sizes and offsets
     uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
@@ -415,6 +423,8 @@ def inflate_sample_table_video(data, multiplier=5):
         (stsc_off, stsc_sz, new_stsc),
         (stco_off, stco_sz, new_stco2),
     ]
+    if ctts_off != -1:
+        replacements.append((ctts_off, ctts_sz, new_ctts))
     replacements.sort(key=lambda x: x[0])
 
     moov_delta = sum(len(new) - old_sz for _, old_sz, new in replacements)
@@ -444,8 +454,8 @@ def inflate_sample_table_video(data, multiplier=5):
     # The _adjust_stco already added moov_delta to all offsets, so they are correct.
 
     # Update durations in mvhd/tkhd/mdhd
-    # stts total duration = (real_count * last_delta) + (fake_count * fake_delta)
-    total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
+    # With single-entry stts, total duration = total_count * new_delta
+    total_stts_dur = total_count * new_delta
     total_sec = total_stts_dur / 90000.0
     mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
     if mvhd_off != -1:
