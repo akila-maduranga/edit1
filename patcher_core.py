@@ -348,13 +348,11 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
     return result
 
 def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation by duplicating sample table entries (no filler NALs).
+    """5x inflation by duplicating sample table entries (no filler NALs, no SPS patch).
     Uses single-entry stts with original per-frame delta (preserves framerate).
     Fake frames are interleaved copies of real frames (each real frame repeated 5x).
     Container durations set to inflated duration.
     """
-    data = _patch_avcC_sps(data)
-
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
