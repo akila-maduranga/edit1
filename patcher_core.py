@@ -308,10 +308,11 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
     return result
 
 def inflate_sample_table_video(data, multiplier=3):
-    """3x inflation by duplicating sample table entries (no filler NALs).
-    Uses two-entry stts: real frames at original delta, fake frames at small delta.
-    Small delta (10) avoids frame freeze while keeping duration reasonable.
-    Reduced from 10x to reduce corruption risk.
+    """Frame inflation with unique stco entries and duplicated mdat data.
+    Actual frame bytes are copied into an extended mdat so each fake
+    frame has its own unique chunk offset — prevents decoder stalling.
+    Uses two-entry stts: real frames at original delta, fake frames at
+    small delta (10) to keep added duration negligible.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
@@ -366,7 +367,7 @@ def inflate_sample_table_video(data, multiplier=3):
     orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
     total_count = real_count * multiplier
     fake_count = total_count - real_count
-    fake_delta = 10  # Small delta to avoid frame freeze (not 1)
+    fake_delta = 10
 
     # Two-entry stts: real frames at original delta, fake frames at small delta
     new_stts_body = struct.pack('>II', 0, 2)
@@ -390,7 +391,7 @@ def inflate_sample_table_video(data, multiplier=3):
     if not real_offsets:
         return None
 
-    # Build new stsz: repeat each real frame 'multiplier' times
+    # Build new stsz: repeat each real frame size 'multiplier' times
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     idx = 0
@@ -405,15 +406,41 @@ def inflate_sample_table_video(data, multiplier=3):
     new_stsc_body += struct.pack('>III', 1, 1, 1)
     new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
 
-    # Build new stco: repeat each real offset 'multiplier' times
-    new_stco_count = total_count
-    new_stco_body2 = bytearray(8 + new_stco_count * 4)
-    struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
-    idx = 0
+    # ── Build copy data and unique stco entries ────────────────────────
+    mdat_off, mdat_sz = _find_box(data, b"mdat")
+
+    # Read actual frame bytes — real_offsets are absolute file positions
+    frame_bytes_list = []
     for i in range(real_count):
-        for _ in range(multiplier):
-            struct.pack_into('>I', new_stco_body2, 8 + idx * 4, real_offsets[i])
+        off = real_offsets[i]
+        sz = real_sizes[i]
+        frame_bytes_list.append(data[off : off + sz])
+
+    # Build concatenated copy bytes and track per-copy offsets
+    copy_chunks = bytearray()
+    copy_offsets_rel = []  # offset of each copy relative to start of copy area
+    for i in range(real_count):
+        for _ in range(multiplier - 1):
+            copy_offsets_rel.append(len(copy_chunks))
+            copy_chunks.extend(frame_bytes_list[i])
+    copy_total = len(copy_chunks)
+
+    # Build new stco with UNIQUE offsets
+    # Original frames use real_offsets (absolute in original file)
+    # Copy frames point to: mdat_off + mdat_sz + copy_off (all absolute, no moov_delta)
+    # _adjust_stco will add moov_delta to all entries later
+    new_stco_body2 = bytearray(8 + total_count * 4)
+    struct.pack_into('>II', new_stco_body2, 0, 0, total_count)
+    idx = 0
+    copy_idx = 0
+    for i in range(real_count):
+        struct.pack_into('>I', new_stco_body2, 8 + idx * 4, real_offsets[i])
+        idx += 1
+        for _ in range(multiplier - 1):
+            copy_abs_off = mdat_off + mdat_sz + copy_offsets_rel[copy_idx]
+            struct.pack_into('>I', new_stco_body2, 8 + idx * 4, copy_abs_off)
             idx += 1
+            copy_idx += 1
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     replacements = [
@@ -426,16 +453,30 @@ def inflate_sample_table_video(data, multiplier=3):
 
     moov_delta = sum(len(new) - old_sz for _, old_sz, new in replacements)
 
-    result = bytearray(len(data) + moov_delta)
+    total_result_len = len(data) + moov_delta + copy_total
+    result = bytearray(total_result_len)
+
     read_pos = 0
     write_pos = 0
     for off, old_sz, new_bytes in replacements:
-        result[write_pos:write_pos + off - read_pos] = data[read_pos:off]
-        write_pos += off - read_pos
+        chunk = data[read_pos:off]
+        result[write_pos:write_pos + len(chunk)] = chunk
+        write_pos += len(chunk)
         result[write_pos:write_pos + len(new_bytes)] = new_bytes
         write_pos += len(new_bytes)
         read_pos = off + old_sz
-    result[write_pos:] = data[read_pos:]
+    # Copy everything after last replacement (moov tail + mdat)
+    remaining = data[read_pos:]
+    result[write_pos:write_pos + len(remaining)] = remaining
+    write_pos += len(remaining)
+
+    # Append copy data right after original mdat
+    copy_start_in_result = mdat_off + moov_delta + mdat_sz
+    result[copy_start_in_result:copy_start_in_result + copy_total] = copy_chunks
+
+    # Update mdat header size to include copies
+    new_mdat_sz = mdat_sz + copy_total
+    struct.pack_into('>I', result, copy_start_in_result - mdat_sz, new_mdat_sz)
 
     # Update container sizes
     for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
@@ -446,15 +487,10 @@ def inflate_sample_table_video(data, multiplier=3):
     new_moov_end = moov_off + moov_sz + moov_delta
     _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-    # We don't need to subtract anything because we repeated offsets (they are relative to mdat start)
-    # and the mdat hasn't moved; we only enlarged moov, so all offsets increase by moov_delta.
-    # The _adjust_stco already added moov_delta to all offsets, so they are correct.
-
     # Update durations in mvhd/tkhd/mdhd
-    # Two-entry stts: total duration = (real_count * last_delta) + (fake_count * fake_delta)
     total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
     total_sec = total_stts_dur / 90000.0
-    mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
+    mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, new_moov_end)
     if mvhd_off != -1:
         ver = result[mvhd_off+12]
         if ver == 0:
@@ -466,7 +502,7 @@ def inflate_sample_table_video(data, multiplier=3):
             mvhd_dur = int(total_sec * mvhd_ts)
             result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
 
-    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
+    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, new_moov_end):
         tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
         if tkhd_off != -1:
             ver = result[tkhd_off+12]
@@ -864,7 +900,7 @@ def move_moov_to_end(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
