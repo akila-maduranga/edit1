@@ -347,6 +347,12 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
+def _u32(val, label=""):
+    """Pack a uint32 with bounds check. Raises ValueError with details on overflow."""
+    if val < 0 or val > 0xFFFFFFFF:
+        raise ValueError(f"uint32 overflow {label}: {val} (0x{val & 0xFFFFFFFFffffffff:016x})")
+    return struct.pack('>I', val)
+
 def inflate_sample_table_video(data, multiplier=5):
     """5x inflation by duplicating sample table entries (no filler NALs).
     Uses single-entry stts where all deltas are proportional (last_delta * multiplier).
@@ -392,134 +398,152 @@ def inflate_sample_table_video(data, multiplier=5):
     if -1 in (stts_off, stsz_off, stco_off, stsc_off):
         return None
 
-    stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
-    real_count = 0
-    last_delta = 0
-    for i in range(stts_entry_count):
-        off = stts_off + 16 + i * 8
-        cnt = int.from_bytes(data[off:off+4], 'big')
-        delta = int.from_bytes(data[off+4:off+8], 'big')
-        real_count += cnt
-        last_delta = delta
+    try:
+        stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
+        real_count = 0
+        last_delta = 0
+        for i in range(stts_entry_count):
+            off = stts_off + 16 + i * 8
+            cnt = int.from_bytes(data[off:off+4], 'big')
+            delta = int.from_bytes(data[off+4:off+8], 'big')
+            real_count += cnt
+            last_delta = delta
 
-    if real_count == 0:
-        return None
+        if real_count == 0:
+            return None
 
-    total_count = min(real_count * multiplier, 0xFFFFFFFF)
-    new_delta = min(last_delta * multiplier, 0xFFFFFFFF)
+        total_count = min(real_count * multiplier, 0xFFFFFFFF)
+        new_delta = min(last_delta * multiplier, 0xFFFFFFFF)
 
-    # Single-entry stts
-    new_stts_body = struct.pack('>II', 0, 1)
-    new_stts_body += struct.pack('>II', total_count, new_delta)
-    new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
+        # Single-entry stts
+        new_stts_body = struct.pack('>II', 0, 1)
+        new_stts_body += struct.pack('>II', total_count, new_delta)
+        new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-    uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
-    orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
-    real_sizes = []
-    for i in range(real_count):
-        if uniform_size != 0:
-            real_sizes.append(uniform_size)
-        elif i < orig_stsz_count:
-            real_sizes.append(int.from_bytes(data[stsz_off+20+i*4:stsz_off+24+i*4], 'big'))
-        else:
-            real_sizes.append(uniform_size if uniform_size else 0)
-
-    real_offsets = _sample_offsets(data, stco_off, stsc_off, stsz_off, real_count)
-    if not real_offsets:
-        return None
-
-    new_stsz_body = bytearray(20 + total_count * 4)
-    struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
-    idx = 0
-    for i in range(real_count):
-        for _ in range(multiplier):
-            struct.pack_into('>I', new_stsz_body, 12 + idx * 4, real_sizes[i])
-            idx += 1
-    new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
-
-    new_stsc_body = struct.pack('>II', 0, 1)
-    new_stsc_body += struct.pack('>III', 1, 1, 1)
-    new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
-
-    new_stco_count = total_count
-    new_stco_body2 = bytearray(8 + new_stco_count * 4)
-    struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
-    idx = 0
-    for i in range(real_count):
-        for _ in range(multiplier):
-            struct.pack_into('>I', new_stco_body2, 8 + idx * 4, real_offsets[i])
-            idx += 1
-    new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
-
-    replacements = [
-        (stts_off, stts_sz, new_stts),
-        (stsz_off, stsz_sz, new_stsz),
-        (stsc_off, stsc_sz, new_stsc),
-        (stco_off, stco_sz, new_stco2),
-    ]
-    replacements.sort(key=lambda x: x[0])
-
-    moov_delta = sum(len(new) - old_sz for _, old_sz, new in replacements)
-
-    result = bytearray(len(data) + moov_delta)
-    read_pos = 0
-    write_pos = 0
-    for off, old_sz, new_bytes in replacements:
-        result[write_pos:write_pos + off - read_pos] = data[read_pos:off]
-        write_pos += off - read_pos
-        result[write_pos:write_pos + len(new_bytes)] = new_bytes
-        write_pos += len(new_bytes)
-        read_pos = off + old_sz
-    result[write_pos:] = data[read_pos:]
-
-    for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
-        old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
-        new_sz = max(old_sz + moov_delta, 8)
-        if new_sz > 0xFFFFFFFF:
-            new_sz = 0xFFFFFFFF
-        struct.pack_into('>I', result, container_off, new_sz)
-
-    new_moov_end = moov_off + moov_sz + moov_delta
-    _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
-
-    total_stts_dur = total_count * new_delta
-    total_sec = total_stts_dur / 90000.0
-    mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
-    if mvhd_off != -1:
-        ver = result[mvhd_off+12]
-        if ver == 0:
-            mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
-            mvhd_dur = min(int(total_sec * mvhd_ts), 0xFFFFFFFF)
-            result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
-        else:
-            mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
-            mvhd_dur = int(total_sec * mvhd_ts)
-            result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
-
-    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
-        tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
-        if tkhd_off != -1:
-            ver = result[tkhd_off+12]
-            if ver == 0:
-                result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', mvhd_dur)
+        uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
+        orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
+        real_sizes = []
+        for i in range(real_count):
+            if uniform_size != 0:
+                real_sizes.append(uniform_size)
+            elif i < orig_stsz_count:
+                real_sizes.append(int.from_bytes(data[stsz_off+20+i*4:stsz_off+24+i*4], 'big'))
             else:
-                result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', mvhd_dur)
+                real_sizes.append(uniform_size if uniform_size else 0)
 
-        mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off != -1:
-            mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
-            if mdhd_off != -1:
-                ver = result[mdhd_off+12]
+        real_offsets = _sample_offsets(data, stco_off, stsc_off, stsz_off, real_count)
+        if not real_offsets:
+            return None
+
+        new_stsz_body = bytearray(20 + total_count * 4)
+        struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
+        idx = 0
+        for i in range(real_count):
+            for _ in range(multiplier):
+                struct.pack_into('>I', new_stsz_body, 12 + idx * 4, real_sizes[i])
+                idx += 1
+        new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
+
+        new_stsc_body = struct.pack('>II', 0, 1)
+        new_stsc_body += struct.pack('>III', 1, 1, 1)
+        new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
+
+        new_stco_count = total_count
+        new_stco_body2 = bytearray(8 + new_stco_count * 4)
+        struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
+        idx = 0
+        for i in range(real_count):
+            for _ in range(multiplier):
+                struct.pack_into('>I', new_stco_body2, 8 + idx * 4, real_offsets[i])
+                idx += 1
+        new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
+
+        replacements = [
+            (stts_off, stts_sz, new_stts),
+            (stsz_off, stsz_sz, new_stsz),
+            (stsc_off, stsc_sz, new_stsc),
+            (stco_off, stco_sz, new_stco2),
+        ]
+        replacements.sort(key=lambda x: x[0])
+
+        moov_delta = sum(len(new) - old_sz for _, old_sz, new in replacements)
+
+        result = bytearray(len(data) + moov_delta)
+        read_pos = 0
+        write_pos = 0
+        for off, old_sz, new_bytes in replacements:
+            result[write_pos:write_pos + off - read_pos] = data[read_pos:off]
+            write_pos += off - read_pos
+            result[write_pos:write_pos + len(new_bytes)] = new_bytes
+            write_pos += len(new_bytes)
+            read_pos = off + old_sz
+        result[write_pos:] = data[read_pos:]
+
+        for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
+            old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
+            new_sz = max(old_sz + moov_delta, 8)
+            if new_sz > 0xFFFFFFFF:
+                new_sz = 0xFFFFFFFF
+            struct.pack_into('>I', result, container_off, new_sz)
+
+        new_moov_end = moov_off + moov_sz + moov_delta
+        _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
+
+        total_stts_dur = total_count * new_delta
+        total_sec = total_stts_dur / 90000.0
+        mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
+        if mvhd_off != -1:
+            ver = result[mvhd_off+12]
+            if ver == 0:
+                mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
+                mvhd_dur = min(int(total_sec * mvhd_ts), 0xFFFFFFFF)
+                result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
+            else:
+                mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
+                mvhd_dur = int(total_sec * mvhd_ts)
+                result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
+
+        for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
+            tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
+            if tkhd_off != -1:
+                ver = result[tkhd_off+12]
                 if ver == 0:
-                    mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
-                    mdhd_dur = min(int(total_sec * mdhd_ts), 0xFFFFFFFF)
-                    result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
+                    result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', mvhd_dur)
                 else:
-                    mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
-                    mdhd_dur = int(total_sec * mdhd_ts)
-                    result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
+                    result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', mvhd_dur)
 
-    return bytes(result)
+            mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
+            if mdia_off != -1:
+                mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+                if mdhd_off != -1:
+                    ver = result[mdhd_off+12]
+                    if ver == 0:
+                        mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
+                        mdhd_dur = min(int(total_sec * mdhd_ts), 0xFFFFFFFF)
+                        result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
+                    else:
+                        mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
+                        mdhd_dur = int(total_sec * mdhd_ts)
+                        result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
+
+        return bytes(result)
+    except (struct.error, ValueError, OverflowError, RuntimeError) as _exc:
+        import traceback, sys
+        _tb = traceback.format_exc()
+        _msg = [f"[INFLATE ERROR] {type(_exc).__name__}: {_exc}"]
+        _locs = locals()
+        for _k in ('real_count','last_delta','total_count','new_delta','moov_delta',
+                   'stbl_sz','minf_sz','mdia_sz','trak_sz','moov_off','moov_sz',
+                   'mvhd_dur','new_sz'):
+            if _k in _locs:
+                _msg.append(f"  {_k}={_locs[_k]}")
+        if 'real_sizes' in _locs and _locs['real_sizes']:
+            _msg.append(f"  real_sizes len={len(_locs['real_sizes'])}, max={max(_locs['real_sizes'])}")
+        if 'real_offsets' in _locs and _locs['real_offsets']:
+            _msg.append(f"  real_offsets len={len(_locs['real_offsets'])}, max={max(_locs['real_offsets'])}")
+        for _line in _tb.splitlines():
+            _msg.append(f"  {_line}")
+        raise RuntimeError("\n".join(_msg)) from None
 
 
 # ── Comment Udta Injection (meta/ilst, only \xa9cmt) ───────────────────
