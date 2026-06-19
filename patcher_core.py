@@ -797,26 +797,115 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     if log_func and original_audio_dur is not None:
         log_func(f"[AUDIO] original duration={original_audio_dur}")
 
-    # Skip remux — use original file directly
+    # ── Pass 1: FFmpeg remux (Faststart, normalize) ──────────────────────
     if log_func:
         log_func("")
-        log_func("── 1/2  Original file (no remux) ────────────────────────────")
-    data = original_data
+        log_func("── 1/8  FFmpeg remux (Faststart) ───────────────────────────")
+    clean = input_path.parent / f"{stem}_clean{suffix}"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-metadata:s:a:0", "handler_name=SoundHandler",
+        str(clean),
+    ]
     if log_func:
-        log_func(f"[DATA] {len(data):,} bytes")
-
-    # ── Pass 2: Frame Count Inflation ──────────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 2/2  Frame Count Inflation (5x, single-entry, proportional) ────────────────")
-    inflated = inflate_sample_table_video(data, multiplier=5)
-    if inflated is None:
+        log_func(f"[REMUX] $ {' '.join(cmd)}")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line and log_func:
+            log_func(f"[ffmpeg] {line}")
+    proc.wait()
+    if proc.returncode != 0:
         if log_func:
-            log_func("[ERROR] Frame inflation failed")
+            log_func(f"[ERROR] ffmpeg exited {proc.returncode}")
         return False
-    data = inflated
     if log_func:
-        log_func("[INFLATE] done")
+        log_func("[REMUX] done")
+
+    data = clean.read_bytes()
+    if log_func:
+        log_func(f"[READ] {len(data):,} bytes")
+        _dump_atoms(data, "REBASE", log_func)
+
+    # ── Pass 2: ZeroLoss Track Bypass (edts/elst) ───────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 2/8  ZeroLoss Track Bypass (elst rebuild) ──────────────")
+    data = rebuild_elst_bypass(data)
+    if log_func:
+        log_func("[ELST] done")
+
+    # ── Pass 3: mvhd Fingerprint ────────────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 3/8  mvhd Fingerprint (next_track_id=9999, fixed date) ──")
+    data = patch_mvhd_fingerprint(data)
+    if log_func:
+        log_func("[MVHD] done")
+
+    # ── Pass 4: Udta Strip (remove ffmpeg encoder tag) ──────────────────
+    if log_func:
+        log_func("")
+        log_func("── 4/8  Udta Strip ─────────────────────────────────────────")
+    data = strip_udta(data)
+    if log_func:
+        log_func("[UDTA] done")
+
+    # ── Pass 5: tkhd Fingerprint ────────────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 5/8  tkhd Fingerprint (alternate_group) ────────────────")
+    data = fingerprint_tkhd(data)
+    if log_func:
+        log_func("[TKHD] done")
+
+    # ── Pass 6: Frame Count Inflation ───────────────────────────────────
+    if use_inflation:
+        if log_func:
+            log_func("")
+            log_func("── 6/8  Frame Count Inflation (5x, sequential, two-entry stts) ────────────────")
+        inflated = inflate_sample_table_video(data, multiplier=5)
+        if inflated is None:
+            if log_func:
+                log_func("[ERROR] Frame inflation failed")
+            try: clean.unlink(missing_ok=True)
+            except: pass
+            return False
+        data = inflated
+        if log_func:
+            log_func("[INFLATE] done")
+    else:
+        if log_func:
+            log_func("")
+            log_func("── 6/8  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
+        data = patch_stsd_codec(data)
+        data = patch_ftyp(data)
+        if log_func:
+            log_func("[CODEC] done")
+
+    # ── Pass 7: Comment Udta Injection ──────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 7/8  Comment Udta Injection ────────────────────────────")
+    if inject_comment:
+        data = inject_comment_udta(data, comment)
+        if log_func:
+            log_func("[COMMENT] injected")
+    else:
+        data = strip_udta(data)  # strip any existing udta
+        if log_func:
+            log_func("[COMMENT] skipped (strip existing udta)")
+
+    # ── Pass 8: Restore original audio duration ─────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 8/8  Audio Duration Restore ────────────────────────────")
+    data = patch_audio_duration(data, original_audio_dur)
+    if log_func:
+        log_func("[AUDIO] done")
 
     # Final verify
     if log_func:
