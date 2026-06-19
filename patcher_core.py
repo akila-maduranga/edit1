@@ -408,10 +408,10 @@ def inflate_sample_table_video(data, multiplier=5):
     total_count = real_count * multiplier
     fake_count = total_count - real_count
 
-    # Single-entry stts: collapse to same total duration as original
-    # This prevents TikTok player from reading past real content and freezing
-    real_total_duration = total_ticks  # Already computed above
-    new_delta = max(1, real_total_duration // total_count)
+    # Single-entry stts with exact original duration
+    # This preserves total_ticks across all samples (real + fake)
+    # Player sees same duration but with more samples, preventing freeze
+    new_delta = total_ticks // total_count
     new_stts_body = struct.pack('>II', 0, 1)
     new_stts_body += struct.pack('>II', total_count, new_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
@@ -513,7 +513,9 @@ def inflate_sample_table_video(data, multiplier=5):
     result[mdat_content_end:mdat_content_end + filler_total] = filler_data
     struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + filler_total)
 
-    # Clip container durations to real video duration (delta=0 means fake frames add no time)
+    # Keep container durations consistent with stts (no clipping)
+    # stts total duration = total_ticks (exact original duration)
+    # Container durations should match stts to avoid duration mismatch
     real_sec = total_ticks / 90000.0
     mvhd_dur = int(real_sec * 1000)
     mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
