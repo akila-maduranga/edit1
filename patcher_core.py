@@ -163,13 +163,15 @@ def rebuild_elst_bypass(data):
     cum_delta = 0
     done_traks = set()
     for off, old_sz, new_bytes, trak_off in modifications:
+        trak_delta = len(new_bytes) - old_sz
         if trak_off in done_traks:
-            cum_delta += len(new_bytes) - old_sz
+            cum_delta += trak_delta
             continue
         done_traks.add(trak_off)
-        trak_sz = int.from_bytes(new_data[trak_off:trak_off+4], 'big')
-        struct.pack_into('>I', new_data, trak_off, trak_sz + cum_delta)
-        cum_delta += len(new_bytes) - old_sz
+        adj_trak_off = trak_off + cum_delta
+        trak_sz = int.from_bytes(new_data[adj_trak_off:adj_trak_off+4], 'big')
+        struct.pack_into('>I', new_data, adj_trak_off, trak_sz + trak_delta)
+        cum_delta += trak_delta
 
     moov_sz = int.from_bytes(new_data[moov_off:moov_off+4], 'big')
     struct.pack_into('>I', new_data, moov_off, moov_sz + total_delta)
