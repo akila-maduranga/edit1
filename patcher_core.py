@@ -257,52 +257,9 @@ def fingerprint_tkhd(data):
 # ── Frame Inflation (two-entry stts + cycle real data + avcC/SPS) ──────
 
 def _patch_avcC_sps(data):
-    """Patch avcC AND SPS profile to High10, level to 5.1 (standard).
-    Reverted from 6.2 to avoid decoder compatibility issues.
+    """Skip avcC/SPS patching - TikTok accepts standard parameters.
+    Reverted to Main Profile (100) and Level 4.0 (40).
     """
-    moov_off, moov_sz = _find_box(data, b"moov")
-    if moov_off == -1:
-        return data
-    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off == -1:
-            continue
-        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
-            continue
-        minf_off, minf_sz = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
-        if minf_off == -1:
-            continue
-        stbl_off, stbl_sz = _find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
-        if stbl_off == -1:
-            continue
-        stsd_off, _ = _find_box(data, b"stsd", stbl_off+8, stbl_off+stbl_sz)
-        if stsd_off == -1:
-            continue
-        stsd_end = stsd_off + int.from_bytes(data[stsd_off:stsd_off+4], 'big')
-        entry_count = int.from_bytes(data[stsd_off+8:stsd_off+12], 'big')
-        pos = stsd_off + 12
-        for _ in range(entry_count):
-            if pos + 8 > stsd_end:
-                break
-            e_sz = int.from_bytes(data[pos:pos+4], 'big')
-            e_type = data[pos+4:pos+8]
-            if e_type == b'avc1':
-                avcC_off, _ = _find_box(data, b'avcC', pos+8, pos+e_sz)
-                if avcC_off == -1:
-                    continue
-                p = bytearray(data)
-                # avcC level + profile
-                p[avcC_off+9] = 110   # profile: High → High10
-                p[avcC_off+10] = 0    # profile_compat
-                p[avcC_off+11] = 51   # level: 5.1 (standard, reverted from 6.2)
-                # SPS NAL is at avcC_off + 16 (after config header)
-                sps_start = avcC_off + 16
-                if sps_start + 3 < len(p):
-                    p[sps_start+1] = 110  # SPS profile_idc
-                    p[sps_start+3] = 51   # SPS level_idc (5.1)
-                return bytes(p)
-            pos += e_sz
     return data
 
 
@@ -406,12 +363,12 @@ def inflate_sample_table_video(data, multiplier=5):
     orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
     total_count = real_count * multiplier
     fake_count = total_count - real_count
-    fake_delta = 1  # Small delta for fake frames
 
-    # Two-entry stts: real frames at original delta, fake frames at delta=1
-    new_stts_body = struct.pack('>II', 0, 2)
-    new_stts_body += struct.pack('>II', real_count, last_delta)
-    new_stts_body += struct.pack('>II', fake_count, fake_delta)
+    # Single-entry stts: multiply all deltas by multiplier
+    # This keeps timeline smooth and avoids parser confusion
+    new_delta = last_delta * multiplier
+    new_stts_body = struct.pack('>II', 0, 1)
+    new_stts_body += struct.pack('>II', total_count, new_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Find mdat for filler NAL placement
@@ -419,9 +376,9 @@ def inflate_sample_table_video(data, multiplier=5):
     if mdat_off == -1:
         return None
 
-    FILLER_NAL = b'\x00\x00\x00\x01\x0c\x80'  # valid H.264 filler NAL
-    FILLER_NAL_SIZE = 512  # pad to 512 bytes to mimic realistic frame size
-    filler_frame = FILLER_NAL + b'\x00' * (FILLER_NAL_SIZE - len(FILLER_NAL))
+    FILLER_NAL = b'\x00\x00\x00\x01\x0c\x00'  # 6-byte filler NAL
+    FILLER_NAL_SIZE = 6  # Simplified to 6 bytes
+    filler_frame = FILLER_NAL
     filler_data = filler_frame * fake_count
     filler_total = len(filler_data)
 
@@ -525,8 +482,8 @@ def inflate_sample_table_video(data, multiplier=5):
     struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + filler_total)
 
     # Keep container durations consistent with stts total duration
-    # stts total duration = (real_count * last_delta) + (fake_count * fake_delta)
-    total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
+    # With single-entry stts, total duration = total_count * new_delta
+    total_stts_dur = total_count * new_delta
     total_sec = total_stts_dur / 90000.0
     mvhd_dur = int(total_sec * 1000)
     mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
@@ -891,7 +848,7 @@ def get_video_resolution(data):
 # ── Move moov to end ─────────────────────────────────────────────────────
 
 def move_moov_to_end(data):
-    """Move moov atom to end of file (non-faststart).
+    """Move moov atom to end of file (non-faststart) and adjust stco offsets.
     TikTok's uploader is known to handle non-faststart files better for this exploit.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
@@ -906,30 +863,36 @@ def move_moov_to_end(data):
     if moov_off > mdat_off:
         return data
 
-    # Reorder: ftyp -> mdat -> moov
     ftyp_off, ftyp_sz = _find_box(data, b"ftyp")
     if ftyp_off == -1:
         return data
 
-    # Build new file structure
-    new_data = bytearray(len(data))
+    # Build new structure: ftyp + mdat + moov
+    new_data = bytearray()
+    new_data += data[ftyp_off:ftyp_off+ftyp_sz]
+    new_data += data[mdat_off:mdat_off+mdat_sz]
+    new_data += data[moov_off:moov_off+moov_sz]
+
+    # After moving, mdat is now at offset ftyp_sz (old position was ftyp_sz + moov_sz)
+    # So all stco offsets must be decreased by moov_sz
+    shift = -moov_sz
+
+    # Find and adjust all stco atoms inside the new moov
+    new_data = bytearray(new_data)
     pos = 0
-
-    # Copy ftyp
-    new_data[pos:pos+ftyp_sz] = data[ftyp_off:ftyp_off+ftyp_sz]
-    pos += ftyp_sz
-
-    # Copy mdat
-    new_data[pos:pos+mdat_sz] = data[mdat_off:mdat_off+mdat_sz]
-    pos += mdat_sz
-
-    # Copy moov
-    new_data[pos:pos+moov_sz] = data[moov_off:moov_off+moov_sz]
-    pos += moov_sz
-
-    # Copy any remaining atoms after moov
-    if moov_off + moov_sz < len(data):
-        new_data[pos:] = data[moov_off+moov_sz:]
+    while pos < len(new_data):
+        idx = new_data.find(b'stco', pos)
+        if idx == -1:
+            break
+        # stco: size(4) type(4) version_flags(4) entry_count(4) [offsets...]
+        entry_count = int.from_bytes(new_data[idx+12:idx+16], 'big')
+        off = idx + 16
+        for _ in range(entry_count):
+            old = int.from_bytes(new_data[off:off+4], 'big')
+            new_off = old + shift
+            new_data[off:off+4] = struct.pack('>I', new_off)
+            off += 4
+        pos = idx + 4  # continue searching
 
     return bytes(new_data)
 
@@ -995,12 +958,13 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         _dump_atoms(data, "REBASE", log_func)
 
     # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ────────────────
-    if log_func:
-        log_func("")
-        log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
-    data = rebuild_elst_bypass(data)
-    if log_func:
-        log_func("[ELST] done")
+    # SKIPPED: Not essential for exploit and often causes issues
+    # if log_func:
+    #     log_func("")
+    #     log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
+    # data = rebuild_elst_bypass(data)
+    # if log_func:
+    #     log_func("[ELST] done")
 
     # ── Pass 3: Subtle mvhd fingerprint ──────────────────────────────
     if log_func:
@@ -1061,6 +1025,14 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     data = inject_comment_udta(data, comment)
     if log_func:
         log_func("[COMMENT] injected")
+
+    # ── Pass 8: Move moov to end (non-faststart) ─────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 8/8  Move moov to end (non-faststart) ───────────────────────")
+    data = move_moov_to_end(data)
+    if log_func:
+        log_func("[MOOV] moved to end")
 
     # Restore original audio duration
     if original_audio_dur is not None:
