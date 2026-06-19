@@ -307,6 +307,122 @@ def _patch_avcC_sps(data):
     return data
 
 
+def patch_color_metadata(data):
+    """Strip HDR color metadata: change colr box to BT.709 (primaries=1,
+    transfer=1, matrix=1). If no colr box exists, add one.
+    """
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
+            continue
+        minf_off, minf_sz = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1:
+            continue
+        stbl_off, stbl_sz = _find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1:
+            continue
+        stsd_off, _ = _find_box(data, b"stsd", stbl_off+8, stbl_off+stbl_sz)
+        if stsd_off == -1:
+            continue
+        stsd_end = stsd_off + int.from_bytes(data[stsd_off:stsd_off+4], 'big')
+        entry_count = int.from_bytes(data[stsd_off+8:stsd_off+12], 'big')
+        pos = stsd_off + 12
+        for _ in range(entry_count):
+            if pos + 8 > stsd_end:
+                break
+            e_sz = int.from_bytes(data[pos:pos+4], 'big')
+            e_type = data[pos+4:pos+8]
+            if e_type == b'avc1':
+                e_end = pos + e_sz
+                colr_off, colr_sz = _find_box(data, b'colr', pos+8, e_end)
+                p = bytearray(data)
+                colr_data = struct.pack('>HHHB', 1, 1, 1, 0)
+                if colr_off != -1:
+                    p[colr_off+10:colr_off+17] = colr_data
+                else:
+                    colr_box = struct.pack('>I4s', 17, b'colr') + struct.pack('>H', 0) + colr_data
+                    p[pos+8:pos+8] = colr_box
+                    stsd_sz = int.from_bytes(p[stsd_off:stsd_off+4], 'big')
+                    struct.pack_into('>I', p, stsd_off, stsd_sz + 17)
+                    struct.pack_into('>I', p, pos, e_sz + 17)
+                    for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
+                        c_sz = int.from_bytes(p[container_off:container_off+4], 'big')
+                        struct.pack_into('>I', p, container_off, c_sz + 17)
+                    _adjust_stco(p, 17, moov_off+8, moov_off+8+moov_sz+17)
+                return bytes(p)
+            pos += e_sz
+    return data
+
+
+def normalize_frame_rate(data, target_fps=60.0):
+    """Change video stts deltas to produce a clean target_fps (default 60).
+    Uses the video mdhd timescale.
+    """
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+    p = bytearray(data)
+    for trak_off, trak_sz, _ in _iter_boxes(p, moov_off+8, moov_off+moov_sz):
+        tkhd_off, _ = _find_box(p, b"tkhd", trak_off+8, trak_off+trak_sz)
+        if tkhd_off == -1:
+            continue
+        mdia_off, mdia_sz = _find_box(p, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(p, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1 or p[hdlr_off+16:hdlr_off+20] != b'vide':
+            continue
+        mdhd_off, _ = _find_box(p, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+        if mdhd_off == -1:
+            continue
+        ver = p[mdhd_off+8]
+        ts_off = mdhd_off + (20 if ver == 0 else 28)
+        timescale = int.from_bytes(p[ts_off:ts_off+4], 'big')
+        clean_delta = max(int(timescale / target_fps), 1)
+        minf_off, minf_sz = _find_box(p, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1:
+            continue
+        stbl_off, stbl_sz = _find_box(p, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1:
+            continue
+        stts_off, stts_sz = _find_box(p, b"stts", stbl_off+8, stbl_off+stbl_sz)
+        if stts_off == -1:
+            continue
+        entry_count = int.from_bytes(p[stts_off+12:stts_off+16], 'big')
+        total_frames = 0
+        for i in range(entry_count):
+            off = stts_off + 16 + i * 8
+            cnt = int.from_bytes(p[off:off+4], 'big')
+            total_frames += cnt
+        new_dur = total_frames * clean_delta
+        new_stts_body = struct.pack('>II', 0, 1)
+        new_stts_body += struct.pack('>II', total_frames, clean_delta)
+        new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
+        delta = len(new_stts) - stts_sz
+        if delta != 0:
+            read_pos = stts_off + stts_sz
+            write_pos = stts_off + len(new_stts)
+            rest_len = len(p) - read_pos
+            p[stts_off:stts_off+len(new_stts)] = new_stts
+            p[write_pos:write_pos+rest_len] = p[read_pos:read_pos+rest_len]
+            p = bytearray(p[:write_pos+rest_len])
+        else:
+            p[stts_off:stts_off+len(new_stts)] = new_stts
+        _adjust_stco(p, delta, moov_off+8, moov_off+8+moov_sz+delta)
+        for box_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
+            old_sz = int.from_bytes(p[box_off:box_off+4], 'big')
+            struct.pack_into('>I', p, box_off, old_sz + delta)
+        moov_sz = int.from_bytes(p[moov_off:moov_off+4], 'big')
+        return bytes(p)
+    return bytes(p)
+
+
 def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
     """Expand chunk offsets to per-sample offsets using stsc + stsz."""
     stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
@@ -380,6 +496,14 @@ def inflate_sample_table_video(data, multiplier=5):
     stbl_off, stbl_sz, trak_off, mdia_off, minf_off = video_stbl
     stbl_end = stbl_off + stbl_sz
 
+    mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, trak_off + int.from_bytes(data[trak_off:trak_off+4], 'big'))
+    if mdhd_off != -1:
+        ver = data[mdhd_off+8]
+        ts_off = mdhd_off + (20 if ver == 0 else 28)
+        video_timescale = int.from_bytes(data[ts_off:ts_off+4], 'big')
+    else:
+        video_timescale = 90000
+
     stts_off, stts_sz = _find_box(data, b"stts", stbl_off+8, stbl_end)
     stsz_off, stsz_sz = _find_box(data, b"stsz", stbl_off+8, stbl_end)
     stco_off, stco_sz = _find_box(data, b"stco", stbl_off+8, stbl_end)
@@ -405,8 +529,9 @@ def inflate_sample_table_video(data, multiplier=5):
         total_count = min(real_count * multiplier, 0xFFFFFFFF)
         fake_count = total_count - real_count
 
+        clean_delta = max(int(video_timescale / 60.0), 1)
         new_stts_body = struct.pack('>II', 0, 2)
-        new_stts_body += struct.pack('>II', real_count, last_delta)
+        new_stts_body += struct.pack('>II', real_count, clean_delta)
         new_stts_body += struct.pack('>II', fake_count, 1)
         new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
@@ -479,8 +604,8 @@ def inflate_sample_table_video(data, multiplier=5):
         new_moov_end = moov_off + moov_sz + moov_delta
         _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-        total_stts_dur = real_count * last_delta + fake_count * 1
-        total_sec = total_stts_dur / 90000.0
+        total_stts_dur = real_count * clean_delta + fake_count * 1
+        total_sec = total_stts_dur / video_timescale
         mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
         if mvhd_off != -1:
             ver = result[mvhd_off+8]
@@ -721,7 +846,7 @@ def patch_stsd_codec(data):
 
 def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
     if log_func:
-        log_func("[JOB] starting NoBlur 7-pass pipeline")
+        log_func("[JOB] starting pipeline")
 
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -797,16 +922,32 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     # ── Pass 5: Tkhd fingerprint ────────────────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 5/7  Tkhd Fingerprint (alternate_group, preserve orientation) ──")
+        log_func("── 5/8  Tkhd Fingerprint (alternate_group, preserve orientation) ──")
     data = fingerprint_tkhd(data)
     if log_func:
         log_func("[TKHD] done")
 
+    # ── Pass 6: Normalize frame rate to clean 60fps ────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 6/8  Frame Rate Normalize (→ 60fps) ──────────────────────")
+    data = normalize_frame_rate(data, target_fps=60.0)
+    if log_func:
+        log_func("[FPS] normalized")
+
+    # ── Pass 7: Strip HDR color metadata ──────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 7/8  Color Metadata (colr → BT.709) ──────────────────────")
+    data = patch_color_metadata(data)
+    if log_func:
+        log_func("[COLOR] patched")
+
     if use_inflation:
-        # ── Pass 6a: Frame Count Inflation ────────────────────────────
+        # ── Pass 8a: Frame Count Inflation ────────────────────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Frame Count Inflation (5x, sequential, two-entry stts) ─────────────────")
+            log_func("── 8/8  Frame Count Inflation (5x, 60fps, sequential, two-entry stts) ──────────")
         inflated = inflate_sample_table_video(data, multiplier=5)
         if inflated is None:
             if log_func:
@@ -818,20 +959,20 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         if log_func:
             log_func("[INFLATE] done")
     else:
-        # ── Pass 6b: Codec + Brand Spoofing ───────────────────────────
+        # ── Pass 8b: Codec + Brand Spoofing ───────────────────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
+            log_func("── 8/8  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
         data = patch_stsd_codec(data)
         data = patch_ftyp(data)
         if log_func:
             log_func("[CODEC] done")
     
-    # ── Pass 7: Comment Udta Injection ───────────────────────────────────
+    # ── Comment Udta Injection (optional pass 9) ─────────────────────────
     if inject_comment:
         if log_func:
             log_func("")
-            log_func("── 7/7  Comment Udta Injection ─────────────────────────────")
+            log_func("── 9/9  Comment Udta Injection ─────────────────────────────")
         data = inject_comment_udta(data, comment)
         if log_func:
             log_func("[COMMENT] injected")
