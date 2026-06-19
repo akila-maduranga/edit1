@@ -347,12 +347,6 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def _u32(val, label=""):
-    """Pack a uint32 with bounds check. Raises ValueError with details on overflow."""
-    if val < 0 or val > 0xFFFFFFFF:
-        raise ValueError(f"uint32 overflow {label}: {val} (0x{val & 0xFFFFFFFFffffffff:016x})")
-    return struct.pack('>I', val)
-
 def inflate_sample_table_video(data, multiplier=5):
     """5x inflation by duplicating sample table entries (no filler NALs).
     Uses single-entry stts where all deltas are proportional (last_delta * multiplier).
@@ -500,17 +494,17 @@ def inflate_sample_table_video(data, multiplier=5):
                 result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
             else:
                 mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
-                mvhd_dur = int(total_sec * mvhd_ts)
+                mvhd_dur = min(int(total_sec * mvhd_ts), 0xFFFFFFFF)
                 result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
 
         for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
             tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
             if tkhd_off != -1:
                 ver = result[tkhd_off+12]
-                if ver == 0:
-                    result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', mvhd_dur)
-                else:
-                    result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', mvhd_dur)
+            if ver == 0:
+                result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', min(mvhd_dur, 0xFFFFFFFF))
+            else:
+                result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', mvhd_dur)
 
             mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
             if mdia_off != -1:
@@ -523,7 +517,7 @@ def inflate_sample_table_video(data, multiplier=5):
                         result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
                     else:
                         mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
-                        mdhd_dur = int(total_sec * mdhd_ts)
+                        mdhd_dur = min(int(total_sec * mdhd_ts), 0xFFFFFFFF)
                         result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
 
         return bytes(result)
