@@ -303,12 +303,9 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
     return result
 
 def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation with filler NALs.
-    Real frames at original delta, fake frames at delta=1.
-    Filler NALs appended at end of mdat.
+    """5x inflation by duplicating sample table entries (no filler NALs).
+    Uses single-entry stts where all deltas are multiplied by multiplier.
     """
-    data = _patch_avcC_sps(data)
-
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
@@ -319,9 +316,7 @@ def inflate_sample_table_video(data, multiplier=5):
         if mdia_off == -1:
             continue
         hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1:
-            continue
-        if data[hdlr_off+16:hdlr_off+20] != b'vide':
+        if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
             continue
         minf_off, minf_sz = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
         if minf_off == -1:
@@ -346,46 +341,32 @@ def inflate_sample_table_video(data, multiplier=5):
     if -1 in (stts_off, stsz_off, stco_off, stsc_off):
         return None
 
+    # Read real frame count and delta
     stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
     real_count = 0
     last_delta = 0
-    total_ticks = 0
     for i in range(stts_entry_count):
         off = stts_off + 16 + i * 8
         cnt = int.from_bytes(data[off:off+4], 'big')
         delta = int.from_bytes(data[off+4:off+8], 'big')
         real_count += cnt
         last_delta = delta
-        total_ticks += cnt * delta
+
     if real_count == 0:
         return None
 
     orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
     total_count = real_count * multiplier
-    fake_count = total_count - real_count
-    fake_delta = 1  # Small delta for fake frames
+    new_delta = last_delta * multiplier  # proportional
 
-    # Two-entry stts: real frames at original delta, fake frames at delta=1
-    # Avoids integer overflow from proportional delta multiplication
-    new_stts_body = struct.pack('>II', 0, 2)
-    new_stts_body += struct.pack('>II', real_count, last_delta)
-    new_stts_body += struct.pack('>II', fake_count, fake_delta)
+    # Single-entry stts
+    new_stts_body = struct.pack('>II', 0, 1)
+    new_stts_body += struct.pack('>II', total_count, new_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-    # Find mdat for filler NAL placement
-    mdat_off, mdat_sz = _find_box(data, b"mdat")
-    if mdat_off == -1:
-        return None
-
-    FILLER_NAL = b'\x00\x00\x00\x01\x0c'  # correct 5-byte H.264 filler NAL
-    FILLER_NAL_SIZE = 512  # pad to 512 bytes to mimic realistic frame size
-    filler_frame = FILLER_NAL + b'\x00' * (FILLER_NAL_SIZE - len(FILLER_NAL))
-    filler_data = filler_frame * fake_count
-    filler_total = len(filler_data)
-
-    # Read real frame sizes
-    orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
+    # Read real frame sizes and offsets
     uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
+    orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
     real_sizes = []
     for i in range(real_count):
         if uniform_size != 0:
@@ -399,38 +380,30 @@ def inflate_sample_table_video(data, multiplier=5):
     if not real_offsets:
         return None
 
-    # Non-interleaved stsz: all real, then fake frames use FILLER_NAL_SIZE
+    # Build new stsz: repeat each real frame's size 'multiplier' times
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
+    idx = 0
     for i in range(real_count):
-        struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
-    for i in range(fake_count):
-        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, FILLER_NAL_SIZE)
+        for _ in range(multiplier):
+            struct.pack_into('>I', new_stsz_body, 12 + idx * 4, real_sizes[i])
+            idx += 1
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
-    # stsc: all chunks have 1 sample (simpler approach)
+    # stsc: all chunks have 1 sample
     new_stsc_body = struct.pack('>II', 0, 1)
     new_stsc_body += struct.pack('>III', 1, 1, 1)
     new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
 
+    # Build new stco: repeat each real offset 'multiplier' times
     new_stco_count = total_count
-    stts_delta = len(new_stts) - stts_sz
-    stsz_delta = len(new_stsz) - stsz_sz
-    stco_delta = (new_stco_count - orig_stco_count) * 4
-    stsc_delta = len(new_stsc) - stsc_sz
-    moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
-
-    # Non-interleaved stco: all real offsets, then fake frames point to filler NALs
-    # Filler NALs will be appended at end of mdat
-    safe_offset = mdat_off + mdat_sz  # End of original mdat
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
+    idx = 0
     for i in range(real_count):
-        struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i] + moov_delta)
-    for i in range(fake_count):
-        # Point fake frames to filler NALs at end of mdat
-        pos = safe_offset + moov_delta + i * FILLER_NAL_SIZE
-        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
+        for _ in range(multiplier):
+            struct.pack_into('>I', new_stco_body2, 8 + idx * 4, real_offsets[i])
+            idx += 1
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     replacements = [
@@ -441,52 +414,35 @@ def inflate_sample_table_video(data, multiplier=5):
     ]
     replacements.sort(key=lambda x: x[0])
 
-    new_size = len(data) + moov_delta + filler_total
-    result = bytearray(new_size)
+    moov_delta = sum(len(new) - old_sz for _, old_sz, new in replacements)
 
+    result = bytearray(len(data) + moov_delta)
     read_pos = 0
     write_pos = 0
-    new_video_stco_off = None  # Track new offset of video stco
     for off, old_sz, new_bytes in replacements:
         result[write_pos:write_pos + off - read_pos] = data[read_pos:off]
         write_pos += off - read_pos
-        if off == stco_off:  # This is the video stco
-            new_video_stco_off = write_pos
         result[write_pos:write_pos + len(new_bytes)] = new_bytes
         write_pos += len(new_bytes)
         read_pos = off + old_sz
-    result[write_pos:write_pos + len(data) - read_pos] = data[read_pos:]
-    write_pos += len(data) - read_pos
+    result[write_pos:] = data[read_pos:]
 
+    # Update container sizes
     for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
         old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
         struct.pack_into('>I', result, container_off, old_sz + moov_delta)
 
-    # Adjust all stco atoms by moov_delta (including audio stco)
+    # Adjust all stco atoms (including audio) by moov_delta
     new_moov_end = moov_off + moov_sz + moov_delta
     _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-    # Subtract moov_delta from video stco offsets we already adjusted
-    # Use the tracked new_video_stco_off from replacement loop
-    if new_video_stco_off is not None:
-        video_stco_off = new_video_stco_off
-        video_stco_count = new_stco_count
-        for i in range(video_stco_count):
-            # stco header: size(4)+type(4)+version_flags(4)+entry_count(4) = 16
-            offset_off = video_stco_off + 16 + i * 4
-            current_offset = int.from_bytes(result[offset_off:offset_off+4], 'big')
-            struct.pack_into('>I', result, offset_off, current_offset - moov_delta)
+    # We don't need to subtract anything because we repeated offsets (they are relative to mdat start)
+    # and the mdat hasn't moved; we only enlarged moov, so all offsets increase by moov_delta.
+    # The _adjust_stco already added moov_delta to all offsets, so they are correct.
 
-    # Append filler data at end of mdat
-    mdat_content_end = mdat_off + moov_delta + mdat_sz
-    result[mdat_content_end:mdat_content_end + filler_total] = filler_data
-    struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + filler_total)
-
-    # Keep container durations consistent with stts total duration
-    # stts total duration = (real_count * last_delta) + (fake_count * fake_delta)
-    total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
+    # Update durations in mvhd/tkhd/mdhd
+    total_stts_dur = total_count * new_delta
     total_sec = total_stts_dur / 90000.0
-    mvhd_dur = int(total_sec * 1000)
     mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
     if mvhd_off != -1:
         ver = result[mvhd_off+12]
@@ -509,25 +465,18 @@ def inflate_sample_table_video(data, multiplier=5):
                 result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', mvhd_dur)
 
         mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off == -1:
-            continue
-        hdlr_off, _ = _find_box(result, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1:
-            continue
-        mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
-        if mdhd_off == -1:
-            continue
-        is_video = result[hdlr_off+16:hdlr_off+20] == b'vide'
-        ver = result[mdhd_off+12]
-        if is_video:
-            if ver == 0:
-                mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
-                mdhd_dur = int(total_sec * mdhd_ts)
-                result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
-            else:
-                mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
-                mdhd_dur = int(total_sec * mdhd_ts)
-                result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
+        if mdia_off != -1:
+            mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+            if mdhd_off != -1:
+                ver = result[mdhd_off+12]
+                if ver == 0:
+                    mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
+                    mdhd_dur = int(total_sec * mdhd_ts)
+                    result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
+                else:
+                    mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
+                    mdhd_dur = int(total_sec * mdhd_ts)
+                    result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
 
     return bytes(result)
 
