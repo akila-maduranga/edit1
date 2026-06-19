@@ -797,41 +797,26 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     if log_func and original_audio_dur is not None:
         log_func(f"[AUDIO] original duration={original_audio_dur}")
 
-    # ── Pass 1: FFmpeg remux (Faststart, normalize) ──────────────────────
+    # Skip remux — use original file directly
     if log_func:
         log_func("")
-        log_func("── 1/7  FFmpeg remux (Faststart) ───────────────────────────")
-    clean = input_path.parent / f"{stem}_clean{suffix}"
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        "-metadata:s:a:0", "handler_name=SoundHandler",
-        str(clean),
-    ]
+        log_func("── 1/2  Original file (no remux) ────────────────────────────")
+    data = original_data
     if log_func:
-        log_func(f"[REMUX] $ {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line and log_func:
-            log_func(f"[ffmpeg] {line}")
-    proc.wait()
-    if proc.returncode != 0:
+        log_func(f"[DATA] {len(data):,} bytes")
+
+    # ── Pass 2: Frame Count Inflation ──────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 2/2  Frame Count Inflation (5x, single-entry, proportional) ────────────────")
+    inflated = inflate_sample_table_video(data, multiplier=5)
+    if inflated is None:
         if log_func:
-            log_func(f"[ERROR] ffmpeg exited {proc.returncode}")
+            log_func("[ERROR] Frame inflation failed")
         return False
+    data = inflated
     if log_func:
-        log_func("[REMUX] done")
-
-    data = clean.read_bytes()
-    if log_func:
-        log_func(f"[READ] {len(data):,} bytes")
-        _dump_atoms(data, "REBASE", log_func)
-
-    if log_func:
-        log_func("[PASS] all passes skipped — outputting clean remux only")
+        log_func("[INFLATE] done")
 
     # Final verify
     if log_func:
@@ -846,9 +831,6 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     output_path.write_bytes(data)
     if log_func:
         log_func(f"[WRITE] {output_path.name}  ({len(data):,} bytes)")
-
-    try: clean.unlink(missing_ok=True)
-    except: pass
 
     if log_func:
         log_func(f"[DONE]  {output_path.name}")
