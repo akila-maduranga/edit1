@@ -461,14 +461,19 @@ def inflate_sample_table_video(data, multiplier=5):
         fake_count = total_count - real_count
 
         orig_total_dur_ticks = 0
+        orig_last_delta = 0
         for i in range(stts_entry_count):
             off = stts_off + 16 + i * 8
             cnt = int.from_bytes(data[off:off+4], 'big')
             d = int.from_bytes(data[off+4:off+8], 'big')
             orig_total_dur_ticks += cnt * d
-        proportional_delta = max(int(orig_total_dur_ticks / total_count), 1)
-        new_stts_body = struct.pack('>II', 0, 1)
-        new_stts_body += struct.pack('>II', total_count, proportional_delta)
+            orig_last_delta = d
+
+        # Two-entry stts: real frames at original delta, fake frames at 1 tick
+        fake_delta = 1
+        new_stts_body = struct.pack('>II', 0, 2)
+        new_stts_body += struct.pack('>II', real_count, orig_last_delta)
+        new_stts_body += struct.pack('>II', fake_count, fake_delta)
         new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
         uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
@@ -489,15 +494,13 @@ def inflate_sample_table_video(data, multiplier=5):
         last_real_offset = real_offsets[-1]
         last_real_size = real_sizes[-1]
 
-        fake_data_max = min(last_real_size, fake_count)
-        fake_sz = max(1, last_real_size // fake_count)
-
+        # Duplicate last frame for all fake frames
         new_stsz_body = bytearray(20 + total_count * 4)
         struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
         for i in range(real_count):
             struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
         for i in range(fake_count):
-            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, fake_sz)
+            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, last_real_size)
         new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
         new_stsc_body = struct.pack('>II', 0, 1)
@@ -509,7 +512,7 @@ def inflate_sample_table_video(data, multiplier=5):
         for i in range(real_count):
             struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
         for i in range(fake_count):
-            struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, last_real_offset + min(i, fake_data_max - 1))
+            struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, last_real_offset)
         new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
         replacements = [
@@ -543,7 +546,7 @@ def inflate_sample_table_video(data, multiplier=5):
         new_moov_end = moov_off + moov_sz + moov_delta
         _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-        total_stts_dur = total_count * proportional_delta
+        total_stts_dur = real_count * orig_last_delta + fake_count * fake_delta
         total_sec = total_stts_dur / video_timescale
         mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
         if mvhd_off != -1:
