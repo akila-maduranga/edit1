@@ -41,7 +41,7 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str):
         def log_func(msg):
             log.put(msg)
 
-        success = patch_all(src, out_path, comment=comment, log_func=log_func, use_inflation=False)
+        success = patch_all(src, out_path, comment=comment, log_func=log_func)
 
         if success:
             _job_output[job_id] = f"{job_id}_{out_name}"

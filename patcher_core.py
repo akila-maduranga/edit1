@@ -5,9 +5,9 @@ Core patching engine — TikTok bypass with fingerprint-based re-encode preventi
 Pipeline:
    1. FFmpeg remux (Faststart, normalize)
    2. ZeroLoss Track Bypass (edts/elst rebuild)
-   3. mvhd Fingerprint (zero dates)
-   4. Udta Strip (remove ffmpeg encoder signature)
-   5. Tkhd Fingerprint (zero alternate_group)
+    3. mvhd Fingerprint (next_track_id = 9999, fixed creation date)
+    4. Udta Strip (remove ffmpeg encoder signature)
+    5. Tkhd Fingerprint (alternate_group, preserve orientation)
    6. Frame Count Inflation (5x, sequential, two-entry stts, no filler NALs)
    7. Comment Udta Injection (Apple iTunes-style only)
    8. Restore original audio duration
@@ -134,6 +134,8 @@ def rebuild_elst_bypass(data):
             v = data[mdhd_off+8]
             ts_off = mdhd_off + (24 if v == 0 else 32)
             timescale = int.from_bytes(data[ts_off:ts_off+4], 'big')
+            if timescale == 90000:
+                media_time = 6000
 
         edts_bytes = build_edts_atom(duration, media_time)
         edts_off, edts_sz = _find_box(data, b"edts", trak_off+8, trak_off+trak_sz)
@@ -179,7 +181,9 @@ def rebuild_elst_bypass(data):
 # ── Subtle mvhd fingerprint ─────────────────────────────────────────
 
 def patch_mvhd_fingerprint(data):
-    """Zero out mvhd dates to match TikTok source style; keep original next_track_id."""
+    """Change mvhd.next_track_id to a large value + set a fixed creation time.
+    Alters the file's hash/signature without introducing suspicious matrix values.
+    """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
@@ -190,10 +194,16 @@ def patch_mvhd_fingerprint(data):
     version = p[mvhd_off+8]
     if version == 0:
         ct_off = mvhd_off + 12
+        nti_off = mvhd_off + 84
     else:
         ct_off = mvhd_off + 20
+        nti_off = mvhd_off + 96
+    rand_ts = random.randint(1_600_000_000, 1_750_000_000)
     if ct_off + 8 <= len(p):
-        struct.pack_into('>II', p, ct_off, 0, 0)
+        struct.pack_into('>II', p, ct_off, rand_ts, rand_ts)
+    rand_nti = random.randint(100, 9998)
+    if nti_off + 4 <= len(p):
+        struct.pack_into('>I', p, nti_off, rand_nti)
     return bytes(p)
 
 
@@ -214,42 +224,17 @@ def strip_udta(data):
     return bytes(data)
 
 
-# ── Tkhd fingerprint + zero all dates ─────────────────────────────────
-
-def zero_metadata_dates(data):
-    """Zero creation/modification dates in tkhd and mdhd throughout moov."""
-    moov_off, moov_sz = _find_box(data, b"moov")
-    if moov_off == -1:
-        return data
-    p = bytearray(data)
-    for trak_off, trak_sz, _ in _iter_boxes(p, moov_off+8, moov_off+moov_sz):
-        tkhd_off, _ = _find_box(p, b"tkhd", trak_off+8, trak_off+trak_sz)
-        if tkhd_off != -1:
-            ver = p[tkhd_off+8]
-            if ver == 0:
-                ct_off = tkhd_off + 12
-            else:
-                ct_off = tkhd_off + 20
-            if ct_off + 8 <= len(p):
-                struct.pack_into('>II', p, ct_off, 0, 0)
-        mdhd_off, _ = _find_box(p, b"mdhd", trak_off+8, trak_off+trak_sz)
-        if mdhd_off != -1:
-            ver = p[mdhd_off+8]
-            if ver == 0:
-                ct_off = mdhd_off + 12
-            else:
-                ct_off = mdhd_off + 20
-            if ct_off + 8 <= len(p):
-                struct.pack_into('>II', p, ct_off, 0, 0)
-    return bytes(p)
-
+# ── Tkhd fingerprint ──────────────────────────────────────────────────
 
 def fingerprint_tkhd(data):
-    """Zero out tkhd alternate_group to match TikTok source style."""
+    """Set alternate_group for fingerprinting while preserving original tkhd
+    matrix (rotation/orientation from the original encoder).
+    """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
     p = bytearray(data)
+    group_id = 1
     for trak_off, trak_sz, _ in _iter_boxes(p, moov_off+8, moov_off+moov_sz):
         tkhd_off, _ = _find_box(p, b"tkhd", trak_off+8, trak_off+trak_sz)
         if tkhd_off == -1:
@@ -262,7 +247,8 @@ def fingerprint_tkhd(data):
         else:
             continue
         if group_off + 2 <= len(p):
-            struct.pack_into('>H', p, group_off, 0)
+            struct.pack_into('>H', p, group_off, group_id)
+            group_id += 1
     return bytes(p)
 
 
@@ -787,14 +773,6 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     if log_func:
         log_func(f"[READ] {len(data):,} bytes")
         _dump_atoms(data, "REBASE", log_func)
-
-    # ── Pass 1b: Zero all metadata dates ──────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 1b/7  Zero Metadata Dates ──────────────────────────────")
-    data = zero_metadata_dates(data)
-    if log_func:
-        log_func("[DATES] zeroed")
 
     # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ────────────────
     if log_func:
