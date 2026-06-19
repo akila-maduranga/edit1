@@ -345,10 +345,10 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation with IDR frame-based filler.
+def inflate_sample_table_video(data, multiplier=1.2):
+    """1.2x inflation with filler NALs (very subtle).
     Real frames at original delta, fake frames at delta=1.
-    Fake frames point to IDR frames (keyframes) for decode independence.
+    Filler NALs appended at end of mdat.
     """
     data = _patch_avcC_sps(data)
 
@@ -937,7 +937,7 @@ def move_moov_to_end(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
@@ -1063,14 +1063,6 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     data = inject_comment_udta(data, comment)
     if log_func:
         log_func("[COMMENT] injected")
-
-    # ── Pass 8: Move moov to end (non-faststart) ─────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 8/8  Move moov to end (non-faststart) ───────────────────────")
-    data = move_moov_to_end(data)
-    if log_func:
-        log_func("[MOOV] moved to end")
 
     # Restore original audio duration
     if original_audio_dur is not None:
