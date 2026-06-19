@@ -307,10 +307,11 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=10):
-    """10x inflation by duplicating sample table entries (no filler NALs).
+def inflate_sample_table_video(data, multiplier=3):
+    """3x inflation by duplicating sample table entries (no filler NALs).
     Uses two-entry stts: real frames at original delta, fake frames at small delta.
     Small delta (10) avoids frame freeze while keeping duration reasonable.
+    Reduced from 10x to reduce corruption risk.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
@@ -863,7 +864,7 @@ def move_moov_to_end(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
@@ -960,9 +961,9 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         # ── Pass 6a: Frame Count Inflation ────────────────────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Frame Count Inflation (10x, delta=10 for fake) ─────")
+            log_func("── 6/7  Frame Count Inflation (3x, delta=10 for fake) ─────")
         # Use custom inflation with two-entry stts to avoid frame freeze
-        inflated = inflate_sample_table_video(data, multiplier=10)
+        inflated = inflate_sample_table_video(data, multiplier=3)
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
