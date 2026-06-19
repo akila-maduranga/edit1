@@ -543,6 +543,8 @@ def inflate_sample_table_video(data, multiplier=5):
             _msg.append(f"  real_offsets len={len(_locs['real_offsets'])}, max={max(_locs['real_offsets'])}")
         for _line in _tb.splitlines():
             _msg.append(f"  {_line}")
+        sys.stderr.write("\n".join(_msg) + "\n")
+        sys.stderr.flush()
         raise RuntimeError("\n".join(_msg)) from None
 
 
