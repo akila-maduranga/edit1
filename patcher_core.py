@@ -448,7 +448,7 @@ def inflate_sample_table_video(data, multiplier=5):
 
         # Find mdat data start in the original file (absolute offset)
         mdat_box_off = data.find(b'mdat')
-        mdat_data_start = mdat_box_off + 8  # skip box header (size + type)
+        mdat_data_start = mdat_box_off + 4  # data starts 4 bytes after 'mdat' type field
         orig_mdat_data_sz = int.from_bytes(data[mdat_box_off-4:mdat_box_off], 'big') - 8
 
         new_stco_count = total_count
@@ -839,6 +839,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         if log_func:
             log_func("")
             log_func("── 6/7  Frame Count Inflation (5x, sequential, two-entry stts) ─────────────────")
+        data = _patch_avcC_sps(data)
         inflated = inflate_sample_table_video(data, multiplier=5)
         if inflated is None:
             if log_func:
