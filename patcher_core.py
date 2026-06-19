@@ -186,8 +186,8 @@ def rebuild_elst_bypass(data):
 # ── Subtle mvhd fingerprint ─────────────────────────────────────────
 
 def patch_mvhd_fingerprint(data):
-    """Change mvhd.next_track_id to a large value + set a fixed creation time.
-    Alters the file's hash/signature without introducing suspicious matrix values.
+    """Align mvhd to match real TikTok uploads: epoch 0 timestamps,
+    next_track_id=3 (video + audio).
     """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
@@ -199,18 +199,16 @@ def patch_mvhd_fingerprint(data):
     version = p[mvhd_off+8]
     if version == 0:
         ct_off = mvhd_off + 12
-        dur_off = mvhd_off + 24
         nti_off = mvhd_off + 84
     else:
         ct_off = mvhd_off + 20
-        dur_off = mvhd_off + 32
         nti_off = mvhd_off + 96
-    rand_ts = random.randint(1_600_000_000, 1_750_000_000)
+    # Set creation + modification time to epoch 0 (like real TikTok uploads)
     if ct_off + 8 <= len(p):
-        struct.pack_into('>II', p, ct_off, rand_ts, rand_ts)
-    rand_nti = random.randint(100, 9998)
+        struct.pack_into('>II', p, ct_off, 0, 0)
+    # Set next_track_id to 3 (track 1 = video, track 2 = audio)
     if nti_off + 4 <= len(p):
-        struct.pack_into('>I', p, nti_off, rand_nti)
+        struct.pack_into('>I', p, nti_off, 3)
     return bytes(p)
 
 
@@ -671,20 +669,22 @@ def patch_audio_duration(data, original_duration):
 # ── Ftyp Brand Spoofing ─────────────────────────────────────────────────
 
 def patch_ftyp(data):
-    """Spoof ftyp major brand to mp42 and rewrite compatible brands.
-    TikTok's ingest checks this to detect re-muxed content.
+    """Align ftyp to match real TikTok uploads: major=isom, minor=0.2.0,
+    compatible brands = isom,iso2,avc1,mp41.
     """
     result = bytearray(data)
     ftyp_off, ftyp_sz = _find_box(result, b"ftyp")
     if ftyp_off == -1:
         return data
-    # Change major brand to mp42 (common for TikTok-native uploads)
-    result[ftyp_off+8:ftyp_off+12] = b'mp42'
-    # Rewrite compatible brands
+    # Major brand: isom (TikTok-native)
+    result[ftyp_off+8:ftyp_off+12] = b'isom'
+    # Minor version: 0.2.0
+    result[ftyp_off+12:ftyp_off+16] = struct.pack('>I', 0x00000200)
+    # Compatible brands: isom, iso2, avc1, mp41
     compat = b'isomiso2avc1mp41'
-    compat_end = ftyp_off + 12 + len(compat)
+    compat_end = ftyp_off + 16 + len(compat)
     if compat_end <= ftyp_off + ftyp_sz:
-        result[ftyp_off+12:compat_end] = compat
+        result[ftyp_off+16:compat_end] = compat
     return bytes(result)
 
 
@@ -735,54 +735,17 @@ def shuffle_moov_atoms(data):
 # ── Stsd Codec Spoofing (avc1 -> avc3) ─────────────────────────────────
 
 def patch_avcC_profile(data):
-    """Change avcC profile_idc / level_idc to alter the file fingerprint
-    without re-encoding.  Cycle: High(100) ↔ Main(77) ↔ Baseline(66).
+    """Keep original avcC profile/level to match real TikTok uploads.
+    TikTok-native videos typically use High@4.2 or original encoder values.
     """
-    result = bytearray(data)
-    # avcC box: size(4) + 'avcC'(4) + configVersion(1) + profile(1) + ...
-    # find() returns offset of 'avcC' type field; profile is at +5, level at +7
-    avcC_off = data.find(b'avcC')
-    if avcC_off == -1 or avcC_off + 8 > len(data):
-        return data
-    orig_profile = result[avcC_off + 5]
-    orig_level   = result[avcC_off + 7]
-    new_profile = {100: 77, 77: 66, 66: 100}.get(orig_profile, 77)
-    result[avcC_off + 5] = new_profile
-    level_map = {40: 41, 41: 30, 30: 31, 31: 40}
-    result[avcC_off + 7] = level_map.get(orig_level, 40)
-    return bytes(result)
+    return data
 
 
 def patch_stsd_codec(data):
-    result = bytearray(data)
-    moov_off, moov_sz = _find_box(result, b"moov")
-    if moov_off == -1:
-        return data
-    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz):
-        mdia_off, mdia_sz = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off == -1:
-            continue
-        hdlr_off, _ = _find_box(result, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1:
-            continue
-        if result[hdlr_off+16:hdlr_off+20] != b'vide':
-            continue
-        minf_off, minf_sz = _find_box(result, b"minf", mdia_off+8, mdia_off+mdia_sz)
-        if minf_off == -1:
-            continue
-        stbl_off, stbl_sz = _find_box(result, b"stbl", minf_off+8, minf_off+minf_sz)
-        if stbl_off == -1:
-            continue
-        stsd_off, stsd_sz = _find_box(result, b"stsd", stbl_off+8, stbl_off+stbl_sz)
-        if stsd_off == -1:
-            continue
-        entry_off = stsd_off + 16
-        # More aggressive codec cycling: avc1 -> avc3 -> avc1 (changes fingerprint)
-        if result[entry_off+4:entry_off+8] == b'avc1':
-            result[entry_off+4:entry_off+8] = b'avc3'
-        elif result[entry_off+4:entry_off+8] == b'avc3':
-            result[entry_off+4:entry_off+8] = b'avc1'
-    return bytes(result)
+    """Keep avc1 codec type to match real TikTok upload metadata.
+    Fingerprint diversity comes from inflation and atom order instead.
+    """
+    return data
 
 
 # ── IDR Frame Detection ─────────────────────────────────────────────────
