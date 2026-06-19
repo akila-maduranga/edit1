@@ -107,76 +107,8 @@ def build_edts_atom(duration, media_time=0):
 
 
 def rebuild_elst_bypass(data):
-    moov_off, moov_sz = _find_box(data, b"moov")
-    if moov_off == -1:
-        return data
-
-    data = bytearray(data)
-    modifications = []
-
-    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        tkhd_off, _ = _find_box(data, b"tkhd", trak_off+8, trak_off+trak_sz)
-        if tkhd_off == -1:
-            continue
-        version = data[tkhd_off+8]
-        if version == 1:
-            duration = int.from_bytes(data[tkhd_off+36:tkhd_off+44], 'big')
-        else:
-            duration = int.from_bytes(data[tkhd_off+28:tkhd_off+32], 'big')
-
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off == -1:
-            continue
-        mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
-        media_time = 0
-        if mdhd_off != -1:
-            v = data[mdhd_off+8]
-            ts_off = mdhd_off + (24 if v == 0 else 32)
-            timescale = int.from_bytes(data[ts_off:ts_off+4], 'big')
-            if timescale == 90000:
-                media_time = 6000
-
-        edts_bytes = build_edts_atom(duration, media_time)
-        edts_off, edts_sz = _find_box(data, b"edts", trak_off+8, trak_off+trak_sz)
-        if edts_off != -1:
-            modifications.append((edts_off, edts_sz, edts_bytes, trak_off))
-        else:
-            modifications.append((mdia_off, 0, edts_bytes, trak_off))
-
-    modifications.sort(key=lambda x: x[0])
-    if not modifications:
-        return bytes(data)
-
-    total_delta = sum(len(m[2]) - m[1] for m in modifications)
-    new_data = bytearray(len(data) + total_delta)
-    read_pos = 0
-    write_pos = 0
-    for off, old_sz, new_bytes, trak_off in modifications:
-        new_data[write_pos:write_pos + off - read_pos] = data[read_pos:off]
-        write_pos += off - read_pos
-        new_data[write_pos:write_pos + len(new_bytes)] = new_bytes
-        write_pos += len(new_bytes)
-        read_pos = off + old_sz
-    new_data[write_pos:] = data[read_pos:]
-
-    cum_delta = 0
-    done_traks = set()
-    for off, old_sz, new_bytes, trak_off in modifications:
-        trak_delta = len(new_bytes) - old_sz
-        if trak_off in done_traks:
-            cum_delta += trak_delta
-            continue
-        done_traks.add(trak_off)
-        adj_trak_off = trak_off + cum_delta
-        trak_sz = int.from_bytes(new_data[adj_trak_off:adj_trak_off+4], 'big')
-        struct.pack_into('>I', new_data, adj_trak_off, trak_sz + trak_delta)
-        cum_delta += trak_delta
-
-    moov_sz = int.from_bytes(new_data[moov_off:moov_off+4], 'big')
-    struct.pack_into('>I', new_data, moov_off, moov_sz + total_delta)
-    _adjust_stco(new_data, total_delta, moov_off+8, moov_off+8+moov_sz+total_delta)
-
-    return bytes(new_data)
+    """No-op — skipped for now to test if elst is causing rejection."""
+    return data
 
 
 # ── Subtle mvhd fingerprint ─────────────────────────────────────────
