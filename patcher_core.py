@@ -377,9 +377,9 @@ def inflate_sample_table_video(data, multiplier=5):
     if mdat_off == -1:
         return None
 
-    FILLER_NAL = b'\x00\x00\x00\x01\x0c\x00'  # 6-byte filler NAL
-    FILLER_NAL_SIZE = 6  # Simplified to 6 bytes
-    filler_frame = FILLER_NAL
+    FILLER_NAL = b'\x00\x00\x00\x01\x0c'  # correct 5-byte H.264 filler NAL
+    FILLER_NAL_SIZE = 512  # pad to 512 bytes to mimic realistic frame size
+    filler_frame = FILLER_NAL + b'\x00' * (FILLER_NAL_SIZE - len(FILLER_NAL))
     filler_data = filler_frame * fake_count
     filler_total = len(filler_data)
 
