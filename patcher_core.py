@@ -464,14 +464,6 @@ def inflate_sample_table_video(data, multiplier=3):
             copy_idx += 1
     new_stco = struct.pack('>I4s', 8 + len(new_stco_body), b'stco') + bytes(new_stco_body)
 
-    # DEBUG: Check stco body
-    import sys as _sys
-    print('DEBUG stco entries in new body:', file=_sys.stderr)
-    for _i in range(total_count):
-        _v = struct.unpack('>I', new_stco_body[8+_i*4:8+_i*4+4])[0]
-        print(f'  entry {_i}: {_v}', file=_sys.stderr)
-    print('DEBUG mdat_off:', mdat_off, 'mdat_sz:', mdat_sz, file=_sys.stderr)
-
     # Replacements within moov
     replacements = [
         (stts_off, stts_sz, new_stts),
