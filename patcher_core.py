@@ -357,11 +357,14 @@ def inflate_sample_table_video(data, multiplier=5):
 
     orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
     total_count = real_count * multiplier
-    new_delta = last_delta * multiplier  # proportional
+    fake_count = total_count - real_count
+    fake_delta = 1  # Small delta for fake frames
 
-    # Single-entry stts
-    new_stts_body = struct.pack('>II', 0, 1)
-    new_stts_body += struct.pack('>II', total_count, new_delta)
+    # Two-entry stts: real frames at original delta, fake frames at delta=1
+    # Avoids integer overflow from proportional delta multiplication
+    new_stts_body = struct.pack('>II', 0, 2)
+    new_stts_body += struct.pack('>II', real_count, last_delta)
+    new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Read real frame sizes and offsets
@@ -441,7 +444,8 @@ def inflate_sample_table_video(data, multiplier=5):
     # The _adjust_stco already added moov_delta to all offsets, so they are correct.
 
     # Update durations in mvhd/tkhd/mdhd
-    total_stts_dur = total_count * new_delta
+    # stts total duration = (real_count * last_delta) + (fake_count * fake_delta)
+    total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
     total_sec = total_stts_dur / 90000.0
     mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
     if mvhd_off != -1:
