@@ -62,7 +62,7 @@ def _adjust_stco(data, delta, search_start=0, search_end=None):
         off = idx + 12
         for _ in range(entry_count):
             old = int.from_bytes(data[off:off+entry_size], 'big')
-            new_val = old + delta
+            new_val = min(max(old + delta, 0), (1 << (8 * entry_size)) - 1)
             data[off:off+entry_size] = new_val.to_bytes(entry_size, 'big')
             off += entry_size
 
@@ -808,37 +808,46 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     if log_func and original_audio_dur is not None:
         log_func(f"[AUDIO] original duration={original_audio_dur}")
 
-    # ── Pass 1: FFmpeg remux (Faststart, normalize) ──────────────────────
+    # ── Pass 1: Move moov to front (pure Python, preserves all metadata) ──
     if log_func:
         log_func("")
-        log_func("── 1/8  FFmpeg remux (Faststart) ───────────────────────────")
-    clean = input_path.parent / f"{stem}_clean{suffix}"
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        str(clean),
-    ]
-    if log_func:
-        log_func(f"[REMUX] $ {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line and log_func:
-            log_func(f"[ffmpeg] {line}")
-    proc.wait()
-    if proc.returncode != 0:
+        log_func("── 1/8  Python reloov (moov to front) ─────────────────────")
+    data = bytearray(original_data)
+    ftyp_off, ftyp_sz = _find_box(data, b"ftyp")
+    moov_off, moov_sz = _find_box(data, b"moov")
+    mdat_off, mdat_sz = _find_box(data, b"mdat")
+    if ftyp_off == -1 or moov_off == -1 or mdat_off == -1:
         if log_func:
-            log_func(f"[ERROR] ffmpeg exited {proc.returncode}")
+            log_func("[ERROR] missing ftyp, moov, or mdat")
         return False
+    # Build: ftyp + moov + all other boxes (free, etc.) in original order
+    rest = bytearray()
+    pos = 0
+    while pos + 8 <= len(data):
+        sz = int.from_bytes(data[pos:pos+4], 'big')
+        if sz == 0: sz = len(data) - pos
+        btype = data[pos+4:pos+8]
+        if btype not in (b'ftyp', b'moov'):
+            rest.extend(data[pos:pos+sz])
+        pos += sz
+    new_ftyp = data[ftyp_off:ftyp_off+ftyp_sz]
+    new_moov = data[moov_off:moov_off+moov_sz]
+    result = bytearray(new_ftyp + new_moov + rest)
+    # Adjust stco entries by moov position delta
+    orig_mdat_data = mdat_off + 8
+    new_mdat_data = ftyp_sz + moov_sz + 8  # after ftyp, moov, and free's 8-byte header
+    # Actually mdat is the next box in 'rest', so new_mdat_data = ftyp_sz + moov_sz + (rest starts)
+    # rest starts at ftyp_sz + moov_sz, and the first box in rest is the free box (8 bytes) or mdat itself
+    # Let's recalculate: mdat data starts at ftyp_sz + moov_sz + (mdat offset within rest)
+    # Simpler: find mdat position in result
+    new_mdat_off = result.find(b'mdat') - 4
+    new_mdat_data = new_mdat_off + 8
+    delta = new_mdat_data - orig_mdat_data
+    _adjust_stco(result, delta, ftyp_sz + 8, ftyp_sz + 8 + moov_sz)
+    data = bytes(result)
     if log_func:
-        log_func("[REMUX] done")
-
-    data = clean.read_bytes()
-    if log_func:
-        log_func(f"[READ] {len(data):,} bytes")
-        _dump_atoms(data, "REBASE", log_func)
+        log_func(f"[RELOOV] {len(data):,} bytes, stco delta={delta}")
+        _dump_atoms(data, "RELOOV", log_func)
 
     # ── Pass 2: ZeroLoss Track Bypass (edts/elst) ───────────────────────
     if log_func:
@@ -881,8 +890,6 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
-            try: clean.unlink(missing_ok=True)
-            except: pass
             return False
         data = inflated
         if log_func:
