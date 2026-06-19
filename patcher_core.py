@@ -395,9 +395,8 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
     return result
 
 def inflate_sample_table_video(data, multiplier=5):
-    """5x inflation — fake frames share last real frame's data (no filler NALs).
-    Two-entry stts: real frames at original delta, fake frames at 1 tick.
-    Sequential layout: real frames first, then fake frames.
+    """5x inflation — fake frames point to unique 1-byte offsets within last real frame.
+    Single-entry stts with proportional delta. Unique stco per fake frame.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
@@ -490,12 +489,15 @@ def inflate_sample_table_video(data, multiplier=5):
         last_real_offset = real_offsets[-1]
         last_real_size = real_sizes[-1]
 
+        fake_data_max = min(last_real_size, fake_count)
+        fake_sz = max(1, last_real_size // fake_count)
+
         new_stsz_body = bytearray(20 + total_count * 4)
         struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
         for i in range(real_count):
             struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
         for i in range(fake_count):
-            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, last_real_size)
+            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, fake_sz)
         new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
         new_stsc_body = struct.pack('>II', 0, 1)
@@ -507,7 +509,7 @@ def inflate_sample_table_video(data, multiplier=5):
         for i in range(real_count):
             struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
         for i in range(fake_count):
-            struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, last_real_offset)
+            struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, last_real_offset + min(i, fake_data_max - 1))
         new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
         replacements = [

@@ -15,7 +15,7 @@ if __name__ == "__main__":
     p.add_argument("input", help="Input MP4 file")
     p.add_argument("-o", "--output", default="patched_output.mp4", help="Output path")
     p.add_argument("--comment", default=None,
-                   help="\xa9cmt comment (default: auto-generated timestamped tag)")
+                   help="\xa9cmt comment (default: none)")
     p.add_argument("--no-inflate", action="store_true",
                    help="Disable frame count inflation; use codec/brand spoofing instead")
     args = p.parse_args()
