@@ -407,13 +407,13 @@ def inflate_sample_table_video(data, multiplier=5):
     orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
     total_count = real_count * multiplier
     fake_count = total_count - real_count
+    fake_delta = 750
 
-    # Single-entry stts with exact original duration
-    # This preserves total_ticks across all samples (real + fake)
-    # Player sees same duration but with more samples, preventing freeze
-    new_delta = total_ticks // total_count
-    new_stts_body = struct.pack('>II', 0, 1)
-    new_stts_body += struct.pack('>II', total_count, new_delta)
+    # Two-entry stts: real frames at original delta, fake frames at delta=750
+    # This preserves original playback speed for real frames
+    new_stts_body = struct.pack('>II', 0, 2)
+    new_stts_body += struct.pack('>II', real_count, last_delta)
+    new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Find mdat for filler NAL placement
@@ -513,21 +513,22 @@ def inflate_sample_table_video(data, multiplier=5):
     result[mdat_content_end:mdat_content_end + filler_total] = filler_data
     struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + filler_total)
 
-    # Keep container durations consistent with stts (no clipping)
-    # stts total duration = total_ticks (exact original duration)
-    # Container durations should match stts to avoid duration mismatch
-    real_sec = total_ticks / 90000.0
-    mvhd_dur = int(real_sec * 1000)
+    # Keep container durations consistent with stts total duration
+    # stts total duration = (real_count * last_delta) + (fake_count * fake_delta)
+    # This prevents freeze by ensuring timing consistency
+    total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
+    total_sec = total_stts_dur / 90000.0
+    mvhd_dur = int(total_sec * 1000)
     mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
     if mvhd_off != -1:
         ver = result[mvhd_off+12]
         if ver == 0:
             mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
-            mvhd_dur = int(real_sec * mvhd_ts)
+            mvhd_dur = int(total_sec * mvhd_ts)
             result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
         else:
             mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
-            mvhd_dur = int(real_sec * mvhd_ts)
+            mvhd_dur = int(total_sec * mvhd_ts)
             result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
 
     for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
@@ -553,11 +554,11 @@ def inflate_sample_table_video(data, multiplier=5):
         if is_video:
             if ver == 0:
                 mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
-                mdhd_dur = int(real_sec * mdhd_ts)
+                mdhd_dur = int(total_sec * mdhd_ts)
                 result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
             else:
                 mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
-                mdhd_dur = int(real_sec * mdhd_ts)
+                mdhd_dur = int(total_sec * mdhd_ts)
                 result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
 
     return bytes(result)
@@ -816,7 +817,7 @@ def get_video_resolution(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
