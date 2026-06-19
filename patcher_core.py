@@ -305,28 +305,6 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def _nal_to_nonref(frame_bytes, length_size):
-    """Modify the first NAL unit header in an avcC sample to make it
-    non-reference (nal_ref_idc=0).  For IDR NALs (type 5), also change
-    type to 1 (non-IDR slice) — IDR with nal_ref_idc=0 is invalid.
-    Non-reference pictures don't affect the DPB or frame_num counting,
-    so duplicates with identical frame_num become valid H.264.
-    """
-    if len(frame_bytes) <= length_size:
-        return frame_bytes
-    nalu_start = length_size
-    orig_header = frame_bytes[nalu_start]
-    nal_unit_type = orig_header & 0x1F
-    # Clear nal_ref_idc (bits 6-5), preserve forbidden (bit 7) and type (bits 4-0)
-    new_header = orig_header & 0x9F
-    # IDR (type 5) with nal_ref_idc=0 is invalid — change to non-IDR slice (type 1)
-    if nal_unit_type == 5:
-        new_header = (new_header & 0xE0) | 0x01
-    result = bytearray(frame_bytes)
-    result[nalu_start] = new_header
-    return bytes(result)
-
-
 def _get_avcC_length_size(data):
     """Read lengthSizeMinusOne from the avcC decoder config record.
     Returns the length prefix size in bytes (typically 4).
@@ -337,11 +315,35 @@ def _get_avcC_length_size(data):
     return (data[avcC_off + 8] & 0x03) + 1
 
 
+def _nal_make_nonref(frame_bytes, length_size):
+    """Set nal_ref_idc=0 on the first NAL unit.
+    IDR (type 5) frames are left untouched since changing the NAL type
+    alters the slice header syntax (idr_pic_id field), which would break
+    decoding.  Only non-IDR slices get nal_ref_idc cleared.
+    Returns the modified frame bytes.
+    """
+    if len(frame_bytes) <= length_size:
+        return frame_bytes
+    nalu_start = length_size
+    orig_header = frame_bytes[nalu_start]
+    nal_unit_type = orig_header & 0x1F
+    # IDR (type 5) — keep as-is (nal_ref_idc != 0 is required).
+    # Non-slice NALs (type 6-12, etc.) — keep as-is.
+    if nal_unit_type not in (1,):  # non-IDR slice only
+        return frame_bytes
+    new_header = orig_header & 0x9F  # clear nal_ref_idc bits
+    result = bytearray(frame_bytes)
+    result[nalu_start] = new_header
+    return bytes(result)
+
+
 def inflate_sample_table_video(data, multiplier=3):
-    """Frame inflation with duplicated frame data.  Each copy's first NAL
-    header is patched to nal_ref_idc=0 (non-reference) so the decoder
-    treats duplicate frame_num values as valid non-reference pictures
-    that don't conflict in the DPB.
+    """Frame inflation by duplicating real frame data.  Each non-IDR
+    copy gets nal_ref_idc=0 so duplicate frame_num values are valid
+    non-reference pictures.  IDR copies are left as valid IDRs (no
+    conflict since each is a complete keyframe).  stss sync samples
+    are remapped; ctts is removed (filler frames have no composition
+    offset requirement).
     """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
@@ -378,7 +380,7 @@ def inflate_sample_table_video(data, multiplier=3):
     if -1 in (stts_off, stsz_off, stco_off, stsc_off):
         return None
 
-    # Read video mdhd timescale (stts deltas are in these units)
+    # Read video mdhd timescale
     mdia_sz_v = int.from_bytes(data[mdia_off:mdia_off+4], 'big')
     mdhd_off_v, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz_v)
     video_timescale = 90000
@@ -422,44 +424,52 @@ def inflate_sample_table_video(data, multiplier=3):
     if not real_offsets:
         return None
 
-    # Get avcC length prefix size for NAL patching
     length_size = _get_avcC_length_size(data)
+    mdat_off, mdat_sz = _find_box(data, b"mdat")
 
     # Read real frame bytes and build modified copies
     copy_chunks = bytearray()
-    copy_offsets_rel = []
     for i in range(real_count):
         frame_bytes = data[real_offsets[i] : real_offsets[i] + real_sizes[i]]
         for _ in range(multiplier - 1):
-            copy_offsets_rel.append(len(copy_chunks))
-            modified = _nal_to_nonref(frame_bytes, length_size)
+            modified = _nal_make_nonref(frame_bytes, length_size)
             copy_chunks.extend(modified)
     copy_total = len(copy_chunks)
 
-    mdat_off, mdat_sz = _find_box(data, b"mdat")
+    # Relative offsets within copy_chunks for stco
+    copy_offsets_rel = []
+    off = 0
+    for i in range(real_count):
+        fsize = real_sizes[i]
+        for _ in range(multiplier - 1):
+            copy_offsets_rel.append(off)
+            off += fsize
 
-    # Build stts: real frames at original delta, fake at small delta
+    # Build stts
     new_stts_body = struct.pack('>II', 0, 2)
     new_stts_body += struct.pack('>II', real_count, last_delta)
     new_stts_body += struct.pack('>II', fake_count, fake_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-    # Build stsz: repeat each real frame size 'multiplier' times
-    new_stsz_body = bytearray(20 + total_count * 4)
+    # Build stsz
+    body_len = 12 + total_count * 4
+    new_stsz_body = bytearray(body_len)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     idx = 0
     for i in range(real_count):
-        for _ in range(multiplier):
+        struct.pack_into('>I', new_stsz_body, 12 + idx * 4, real_sizes[i])
+        idx += 1
+        for _ in range(multiplier - 1):
             struct.pack_into('>I', new_stsz_body, 12 + idx * 4, real_sizes[i])
             idx += 1
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
-    # stsc: each chunk has 1 sample
+    # stsc: 1 sample per chunk
     new_stsc_body = struct.pack('>II', 0, 1)
     new_stsc_body += struct.pack('>III', 1, 1, 1)
     new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
 
-    # Build stco with unique offsets
+    # Build stco
     new_stco_body = bytearray(8 + total_count * 4)
     struct.pack_into('>II', new_stco_body, 0, 0, total_count)
     idx = 0
@@ -468,8 +478,8 @@ def inflate_sample_table_video(data, multiplier=3):
         struct.pack_into('>I', new_stco_body, 8 + idx * 4, real_offsets[i])
         idx += 1
         for _ in range(multiplier - 1):
-            copy_abs_off = mdat_off + mdat_sz + copy_offsets_rel[copy_idx]
-            struct.pack_into('>I', new_stco_body, 8 + idx * 4, copy_abs_off)
+            abs_off = mdat_off + mdat_sz + copy_offsets_rel[copy_idx]
+            struct.pack_into('>I', new_stco_body, 8 + idx * 4, abs_off)
             idx += 1
             copy_idx += 1
     new_stco = struct.pack('>I4s', 8 + len(new_stco_body), b'stco') + bytes(new_stco_body)
@@ -553,6 +563,21 @@ def inflate_sample_table_video(data, multiplier=3):
                     mdhd_ts = int.from_bytes(result[mdhd_off+28:mdhd_off+32], 'big')
                     mdhd_dur = int(total_sec * mdhd_ts)
                     result[mdhd_off+32:mdhd_off+40] = struct.pack('>Q', mdhd_dur)
+
+    # Update stss sync sample numbers in-place (no size change)
+    stbl_end = stbl_off + int.from_bytes(result[stbl_off+4:stbl_off+8], 'big')
+    stss_off, _ = _find_box(result, b"stss", stbl_off+8, stbl_end)
+    if stss_off != -1:
+        entry_count = int.from_bytes(result[stss_off+12:stss_off+16], 'big')
+        for i in range(entry_count):
+            off = stss_off + 16 + i * 4
+            old = int.from_bytes(result[off:off+4], 'big')
+            new_val = (old - 1) * multiplier + 1
+            struct.pack_into('>I', result, off, new_val)
+    # Zero out ctts entry count (no composition offsets needed for filler)
+    ctts_off, _ = _find_box(result, b"ctts", stbl_off+8, stbl_end)
+    if ctts_off != -1:
+        struct.pack_into('>I', result, ctts_off + 12, 0)
 
     return bytes(result)
 
@@ -761,66 +786,6 @@ def patch_stsd_codec(data):
 
 
 # ── IDR Frame Detection ─────────────────────────────────────────────────
-
-def get_idr_frame_offsets(data):
-    """Return a list of byte offsets (within mdat) of all IDR frames."""
-    moov_off, moov_sz = _find_box(data, b"moov")
-    if moov_off == -1:
-        return []
-
-    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
-        if mdia_off == -1:
-            continue
-        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
-            continue
-        minf_off, minf_sz = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
-        if minf_off == -1:
-            continue
-        stbl_off, stbl_sz = _find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
-        if stbl_off == -1:
-            continue
-        stss_off, stss_sz = _find_box(data, b"stss", stbl_off+8, stbl_off+stbl_sz)
-        if stss_off == -1:
-            # No sync samples – treat first frame as IDR (fallback)
-            break
-        # stss: size(4) type(4) version_flags(4) entry_count(4) [sample_numbers...]
-        entry_count = int.from_bytes(data[stss_off+12:stss_off+16], 'big')
-        sample_numbers = []
-        for i in range(entry_count):
-            sample_num = int.from_bytes(data[stss_off+16+i*4:stss_off+20+i*4], 'big')
-            sample_numbers.append(sample_num)
-
-        # Now get the offsets for these sample numbers
-        stsz_off, _ = _find_box(data, b"stsz", stbl_off+8, stbl_off+stbl_sz)
-        stco_off, _ = _find_box(data, b"stco", stbl_off+8, stbl_off+stbl_sz)
-        stsc_off, _ = _find_box(data, b"stsc", stbl_off+8, stbl_off+stbl_sz)
-
-        # Get sample offsets (using the same logic as _sample_offsets)
-        sample_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
-        offsets = _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count)
-
-        # Filter only IDR sample offsets
-        idr_offsets = []
-        for i, sample_num in enumerate(sample_numbers):
-            if sample_num <= len(offsets):
-                idr_offsets.append(offsets[sample_num-1])
-        return idr_offsets
-
-    # Fallback: return offset of first frame (could be IDR)
-    stsz_off, _ = _find_box(data, b"stsz", 0)
-    if stsz_off == -1:
-        return []
-    sample_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
-    if sample_count == 0:
-        return []
-    stco_off, _ = _find_box(data, b"stco", 0)
-    if stco_off == -1:
-        return []
-    first_offset = int.from_bytes(data[stco_off+16:stco_off+20], 'big')
-    return [first_offset]
-
 
 # ── Video Resolution Detection ─────────────────────────────────────────
 
