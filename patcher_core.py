@@ -349,8 +349,8 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
 
 def inflate_sample_table_video(data, multiplier=5):
     """5x inflation by duplicating sample table entries (no filler NALs).
-    Uses single-entry stts where all deltas are proportional (last_delta * multiplier).
-    All fake frames point to the last real frame's data.
+    Uses single-entry stts with original per-frame delta (preserves framerate).
+    Fake frames are interleaved copies of real frames (each real frame repeated 5x).
     Container durations set to inflated duration.
     """
     data = _patch_avcC_sps(data)
@@ -407,7 +407,7 @@ def inflate_sample_table_video(data, multiplier=5):
             return None
 
         total_count = min(real_count * multiplier, 0xFFFFFFFF)
-        new_delta = min(last_delta * multiplier, 0xFFFFFFFF)
+        new_delta = last_delta
 
         # Single-entry stts
         new_stts_body = struct.pack('>II', 0, 1)
