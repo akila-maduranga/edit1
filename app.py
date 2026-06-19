@@ -70,7 +70,7 @@ def upload():
     if not f.filename.lower().endswith(".mp4"):
         return jsonify({"error": "Only .mp4 files accepted"}), 400
 
-    comment = request.form.get("comment", "@akila")
+    comment = request.form.get("comment", "")
     job_id  = str(uuid.uuid4())
     dest    = UPLOAD_DIR / f"{job_id}_input.mp4"
     f.save(dest)

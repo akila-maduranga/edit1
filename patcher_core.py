@@ -494,13 +494,14 @@ def inflate_sample_table_video(data, multiplier=5):
         last_real_offset = real_offsets[-1]
         last_real_size = real_sizes[-1]
 
-        # Duplicate last frame for all fake frames
+        # Cycle fake frames through all real frame data (avoids duplicate-offset detection)
         new_stsz_body = bytearray(20 + total_count * 4)
         struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
         for i in range(real_count):
             struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
         for i in range(fake_count):
-            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, last_real_size)
+            src = i % real_count
+            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, real_sizes[src])
         new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
         new_stsc_body = struct.pack('>II', 0, 1)
@@ -512,7 +513,8 @@ def inflate_sample_table_video(data, multiplier=5):
         for i in range(real_count):
             struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
         for i in range(fake_count):
-            struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, last_real_offset)
+            src = i % real_count
+            struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, real_offsets[src])
         new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
         replacements = [
@@ -795,7 +797,11 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     stem = input_path.stem
     suffix = input_path.suffix
 
-    inject_comment = comment is not None and comment != "@akila"
+    # Normalize — always inject '@akila' as comment unless user provides a custom one
+    if comment is None or comment == "@akila":
+        final_comment = "@akila"
+    else:
+        final_comment = comment
 
     original_data = input_path.read_bytes()
     original_audio_dur = read_audio_duration(original_data)
@@ -894,14 +900,9 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     if log_func:
         log_func("")
         log_func("── 7/8  Comment Udta Injection ────────────────────────────")
-    if inject_comment:
-        data = inject_comment_udta(data, comment)
-        if log_func:
-            log_func("[COMMENT] injected")
-    else:
-        data = strip_udta(data)  # strip any existing udta
-        if log_func:
-            log_func("[COMMENT] skipped (strip existing udta)")
+    data = inject_comment_udta(data, final_comment)
+    if log_func:
+        log_func(f"[COMMENT] injected ({final_comment!r})")
 
     # ── Pass 8: Restore original audio duration ─────────────────────────
     if log_func:
