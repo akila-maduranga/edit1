@@ -15,7 +15,6 @@ Pipeline:
 
 import struct
 import subprocess
-import time
 import random
 from pathlib import Path
 
@@ -729,10 +728,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
     stem = input_path.stem
     suffix = input_path.suffix
 
-    if comment is None or comment == "@akila":
-        ts = int(time.time())
-        tag = f"{ts}_{random.randint(0, 0xFFFFFFFF):08x}"
-        comment = f"Patched by method.akila - {tag}"
+    inject_comment = comment is not None and comment != "@akila"
 
     original_data = input_path.read_bytes()
     original_audio_dur = read_audio_duration(original_data)
@@ -832,12 +828,16 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
             log_func("[CODEC] done")
     
     # ── Pass 7: Comment Udta Injection ───────────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 7/7  Comment Udta Injection ─────────────────────────────")
-    data = inject_comment_udta(data, comment)
-    if log_func:
-        log_func("[COMMENT] injected")
+    if inject_comment:
+        if log_func:
+            log_func("")
+            log_func("── 7/7  Comment Udta Injection ─────────────────────────────")
+        data = inject_comment_udta(data, comment)
+        if log_func:
+            log_func("[COMMENT] injected")
+    else:
+        if log_func:
+            log_func("[COMMENT] skipped (no custom comment provided)")
 
     # Restore original audio duration
     if original_audio_dur is not None:
