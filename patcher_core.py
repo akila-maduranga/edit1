@@ -292,13 +292,15 @@ def _patch_avcC_sps(data):
                 if avcC_off == -1:
                     continue
                 p = bytearray(data)
-                # avcC level + profile
+                avcC_sz = int.from_bytes(data[avcC_off:avcC_off+4], 'big')
+                avcC_end = avcC_off + avcC_sz
+                # avcC level + profile (always within header bounds for valid avcC)
                 p[avcC_off+9] = 110   # profile: High → High10
                 p[avcC_off+10] = 0    # profile_compat
                 p[avcC_off+11] = 62   # level: 5.1 → 6.2
                 # SPS NAL is at avcC_off + 16 (after config header)
                 sps_start = avcC_off + 16
-                if sps_start + 3 < len(p):
+                if sps_start + 3 < avcC_end:
                     p[sps_start+1] = 110  # SPS profile_idc
                     p[sps_start+3] = 62   # SPS level_idc
                 return bytes(p)
@@ -403,8 +405,8 @@ def inflate_sample_table_video(data, multiplier=5):
     if real_count == 0:
         return None
 
-    total_count = real_count * multiplier
-    new_delta = last_delta * multiplier
+    total_count = min(real_count * multiplier, 0xFFFFFFFF)
+    new_delta = min(last_delta * multiplier, 0xFFFFFFFF)
 
     # Single-entry stts
     new_stts_body = struct.pack('>II', 0, 1)
@@ -472,7 +474,10 @@ def inflate_sample_table_video(data, multiplier=5):
 
     for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
         old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
-        struct.pack_into('>I', result, container_off, old_sz + moov_delta)
+        new_sz = max(old_sz + moov_delta, 8)
+        if new_sz > 0xFFFFFFFF:
+            new_sz = 0xFFFFFFFF
+        struct.pack_into('>I', result, container_off, new_sz)
 
     new_moov_end = moov_off + moov_sz + moov_delta
     _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
@@ -484,7 +489,7 @@ def inflate_sample_table_video(data, multiplier=5):
         ver = result[mvhd_off+12]
         if ver == 0:
             mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
-            mvhd_dur = int(total_sec * mvhd_ts)
+            mvhd_dur = min(int(total_sec * mvhd_ts), 0xFFFFFFFF)
             result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
         else:
             mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
@@ -507,7 +512,7 @@ def inflate_sample_table_video(data, multiplier=5):
                 ver = result[mdhd_off+12]
                 if ver == 0:
                     mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
-                    mdhd_dur = int(total_sec * mdhd_ts)
+                    mdhd_dur = min(int(total_sec * mdhd_ts), 0xFFFFFFFF)
                     result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
                 else:
                     mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
