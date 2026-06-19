@@ -936,7 +936,7 @@ def move_moov_to_end(data):
 
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
-def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=True):
+def patch_all(input_path, output_path, comment=None, log_func=None, use_inflation=False):
     if log_func:
         log_func("[JOB] starting NoBlur 7-pass pipeline")
 
@@ -995,13 +995,12 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         _dump_atoms(data, "REBASE", log_func)
 
     # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ────────────────
-    # SKIPPED: edts/elst modifications might confuse TikTok's uploader
-    # if log_func:
-    #     log_func("")
-    #     log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
-    # data = rebuild_elst_bypass(data)
-    # if log_func:
-    #     log_func("[ELST] done")
+    if log_func:
+        log_func("")
+        log_func("── 2/7  ZeroLoss Track Bypass (edts/elst) ──────────────────")
+    data = rebuild_elst_bypass(data)
+    if log_func:
+        log_func("[ELST] done")
 
     # ── Pass 3: Subtle mvhd fingerprint ──────────────────────────────
     if log_func:
