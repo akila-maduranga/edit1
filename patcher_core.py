@@ -307,10 +307,10 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=1.5):
-    """1.5x inflation by duplicating sample table entries (no filler NALs).
-    Uses single-entry stts where all deltas are multiplied by multiplier.
-    Reduced from 2x to avoid delta overflow.
+def inflate_sample_table_video(data, multiplier=10):
+    """10x inflation by duplicating sample table entries (no filler NALs).
+    Uses single-entry stts with original delta and ctts for composition time.
+    ctts offsets fake frames to avoid frame freeze while maintaining duration.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
@@ -363,22 +363,30 @@ def inflate_sample_table_video(data, multiplier=1.5):
         return None
 
     orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
-    # 1.5x inflation: for every 2 real frames, add 1 fake frame
-    fake_count = real_count // 2  # Add 1 fake frame for every 2 real frames
-    total_count = real_count + fake_count
+    total_count = real_count * multiplier
+    fake_count = total_count - real_count
 
-    # Single-entry stts with proportional delta (like tiktok-quality)
-    # Use ctts to handle composition time offsets for fake frames
-    new_delta = last_delta * 3 // 2  # 1.5x multiplier as integer
+    # Single-entry stts with original delta (not multiplied) to avoid frame freeze
+    # All frames decode at original rate, but ctts will adjust composition times
     new_stts_body = struct.pack('>II', 0, 1)
-    new_stts_body += struct.pack('>II', total_count, new_delta)
+    new_stts_body += struct.pack('>II', total_count, last_delta)
     new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
     # Build ctts: real frames have offset 0, fake frames have negative offsets
-    # This keeps composition time correct while using proportional deltas
-    new_ctts_body = struct.pack('>II', 0, 1)
-    # All frames have composition offset 0 (decode time is handled by stts)
-    new_ctts_body += struct.pack('>II', total_count, 0)
+    # This compresses composition timeline back to original duration
+    # Pattern: repeat each real frame 'multiplier' times with increasing negative offsets
+    new_ctts_body = struct.pack('>II', 0, real_count)
+    ctts_idx = 0
+    for i in range(real_count):
+        # Real frame has offset 0
+        new_ctts_body += struct.pack('>II', 1, 0)
+        ctts_idx += 1
+        # Fake frames have negative offsets to compress timeline
+        for j in range(multiplier - 1):
+            # Offset = -(j+1) * last_delta to make fake frames display at same time as real frame
+            offset = -(j + 1) * last_delta
+            new_ctts_body += struct.pack('>II', 1, offset)
+            ctts_idx += 1
     new_ctts = struct.pack('>I4s', 8 + len(new_ctts_body), b'ctts') + new_ctts_body
 
     # Read real frame sizes and offsets
@@ -397,16 +405,12 @@ def inflate_sample_table_video(data, multiplier=1.5):
     if not real_offsets:
         return None
 
-    # Build new stsz: repeat 2 real frames, then add 1 fake frame (1.5x pattern)
+    # Build new stsz: repeat each real frame 'multiplier' times
     new_stsz_body = bytearray(20 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     idx = 0
     for i in range(real_count):
-        struct.pack_into('>I', new_stsz_body, 12 + idx * 4, real_sizes[i])
-        idx += 1
-        # Add fake frame after every 2 real frames
-        if (i + 1) % 2 == 0 and idx < total_count:
-            # Fake frame uses same size as last real frame
+        for _ in range(multiplier):
             struct.pack_into('>I', new_stsz_body, 12 + idx * 4, real_sizes[i])
             idx += 1
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
@@ -416,17 +420,13 @@ def inflate_sample_table_video(data, multiplier=1.5):
     new_stsc_body += struct.pack('>III', 1, 1, 1)
     new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
 
-    # Build new stco: repeat 2 real offsets, then add 1 fake offset (1.5x pattern)
+    # Build new stco: repeat each real offset 'multiplier' times
     new_stco_count = total_count
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     idx = 0
     for i in range(real_count):
-        struct.pack_into('>I', new_stco_body2, 8 + idx * 4, real_offsets[i])
-        idx += 1
-        # Add fake frame after every 2 real frames
-        if (i + 1) % 2 == 0 and idx < total_count:
-            # Fake frame points to same offset as last real frame
+        for _ in range(multiplier):
             struct.pack_into('>I', new_stco_body2, 8 + idx * 4, real_offsets[i])
             idx += 1
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
@@ -468,8 +468,8 @@ def inflate_sample_table_video(data, multiplier=1.5):
     # The _adjust_stco already added moov_delta to all offsets, so they are correct.
 
     # Update durations in mvhd/tkhd/mdhd
-    # With single-entry stts, total duration = total_count * new_delta
-    total_stts_dur = total_count * new_delta
+    # Use original duration since ctts compresses composition timeline back
+    total_stts_dur = real_count * last_delta
     total_sec = total_stts_dur / 90000.0
     mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
     if mvhd_off != -1:
@@ -978,9 +978,9 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         # ── Pass 6a: Frame Count Inflation ────────────────────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Frame Count Inflation (1.5x, custom) ─────")
-        # Use custom inflation (tiktok-quality requires virtual environment)
-        inflated = inflate_sample_table_video(data, multiplier=1.5)
+            log_func("── 6/7  Frame Count Inflation (10x, ctts-based) ─────")
+        # Use custom inflation with ctts to avoid frame freeze
+        inflated = inflate_sample_table_video(data, multiplier=10)
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
