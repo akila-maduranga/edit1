@@ -830,30 +830,8 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         log_func(f"[READ] {len(data):,} bytes")
         _dump_atoms(data, "REBASE", log_func)
 
-    if use_inflation:
-        # ── Pass 2a: Frame Count Inflation (minimal — only remux + inflate) ──
-        if log_func:
-            log_func("")
-            log_func("── 2/2  Frame Count Inflation (5x, sequential, two-entry stts) ────────────────")
-        inflated = inflate_sample_table_video(data, multiplier=5)
-        if inflated is None:
-            if log_func:
-                log_func("[ERROR] Frame inflation failed")
-            try: clean.unlink(missing_ok=True)
-            except: pass
-            return False
-        data = inflated
-        if log_func:
-            log_func("[INFLATE] done")
-    else:
-        # ── Pass 2b: Codec + Brand Spoofing ───────────────────────────
-        if log_func:
-            log_func("")
-            log_func("── 2/2  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
-        data = patch_stsd_codec(data)
-        data = patch_ftyp(data)
-        if log_func:
-            log_func("[CODEC] done")
+    if log_func:
+        log_func("[PASS] all passes skipped — outputting clean remux only")
 
     # Final verify
     if log_func:
