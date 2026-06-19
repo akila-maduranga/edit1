@@ -307,14 +307,252 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=3):
-    """Frame inflation is fundamentally unreliable without a real H.264
-    encoder — duplicated NAL units carry identical frame_num/POC which
-    causes TikTok's decoder to stall.  This function is kept only as a
-    stub; the pipeline now uses aggressive metadata-only fingerprinting
-    instead (set use_inflation=False in patch_all).
+def _nal_to_nonref(frame_bytes, length_size):
+    """Modify the first NAL unit header in an avcC sample to make it
+    non-reference (nal_ref_idc=0).  For IDR NALs (type 5), also change
+    type to 1 (non-IDR slice) — IDR with nal_ref_idc=0 is invalid.
+    Non-reference pictures don't affect the DPB or frame_num counting,
+    so duplicates with identical frame_num become valid H.264.
     """
-    return None
+    if len(frame_bytes) <= length_size:
+        return frame_bytes
+    nalu_start = length_size
+    orig_header = frame_bytes[nalu_start]
+    # Clear bits 6-5 (nal_ref_idc), keep forbidden(bit7) and type(bits4-0)
+    new_header = orig_header & 0x80  # keep forbidden bit only
+    # Set nal_unit_type=1 (non-IDR slice). If it was already non-VCL
+    # (AUD/SEI etc.) the type change is harmless since nal_ref_idc=0.
+    new_header |= 0x01
+    result = bytearray(frame_bytes)
+    result[nalu_start] = new_header
+    return bytes(result)
+
+
+def _get_avcC_length_size(data):
+    """Read lengthSizeMinusOne from the avcC decoder config record.
+    Returns the length prefix size in bytes (typically 4).
+    """
+    avcC_off = data.find(b'avcC')
+    if avcC_off == -1 or avcC_off + 9 > len(data):
+        return 4  # safe default
+    return (data[avcC_off + 8] & 0x03) + 1
+
+
+def inflate_sample_table_video(data, multiplier=3):
+    """Frame inflation with duplicated frame data.  Each copy's first NAL
+    header is patched to nal_ref_idc=0 (non-reference) so the decoder
+    treats duplicate frame_num values as valid non-reference pictures
+    that don't conflict in the DPB.
+    """
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return None
+
+    # Find video track stbl
+    video_stbl = None
+    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
+            continue
+        minf_off, minf_sz = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1:
+            continue
+        stbl_off, stbl_sz = _find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1:
+            continue
+        video_stbl = (stbl_off, stbl_sz, trak_off, mdia_off, minf_off)
+        break
+
+    if video_stbl is None:
+        return None
+
+    stbl_off, stbl_sz, trak_off, mdia_off, minf_off = video_stbl
+    stbl_end = stbl_off + stbl_sz
+
+    stts_off, stts_sz = _find_box(data, b"stts", stbl_off+8, stbl_end)
+    stsz_off, stsz_sz = _find_box(data, b"stsz", stbl_off+8, stbl_end)
+    stco_off, stco_sz = _find_box(data, b"stco", stbl_off+8, stbl_end)
+    stsc_off, stsc_sz = _find_box(data, b"stsc", stbl_off+8, stbl_end)
+    if -1 in (stts_off, stsz_off, stco_off, stsc_off):
+        return None
+
+    # Read real frame count and delta
+    stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
+    real_count = 0
+    last_delta = 0
+    for i in range(stts_entry_count):
+        off = stts_off + 16 + i * 8
+        cnt = int.from_bytes(data[off:off+4], 'big')
+        delta = int.from_bytes(data[off+4:off+8], 'big')
+        real_count += cnt
+        last_delta = delta
+    if real_count == 0:
+        return None
+
+    total_count = real_count * multiplier
+    fake_count = total_count - real_count
+    fake_delta = 10
+
+    # Read real frame sizes and offsets
+    uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
+    orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
+    real_sizes = []
+    for i in range(real_count):
+        if uniform_size != 0:
+            real_sizes.append(uniform_size)
+        elif i < orig_stsz_count:
+            real_sizes.append(int.from_bytes(data[stsz_off+20+i*4:stsz_off+24+i*4], 'big'))
+        else:
+            real_sizes.append(uniform_size if uniform_size else 0)
+
+    real_offsets = _sample_offsets(data, stco_off, stsc_off, stsz_off, real_count)
+    if not real_offsets:
+        return None
+
+    # Get avcC length prefix size for NAL patching
+    length_size = _get_avcC_length_size(data)
+
+    # Read real frame bytes and build modified copies
+    copy_chunks = bytearray()
+    copy_offsets_rel = []
+    for i in range(real_count):
+        frame_bytes = data[real_offsets[i] : real_offsets[i] + real_sizes[i]]
+        for _ in range(multiplier - 1):
+            copy_offsets_rel.append(len(copy_chunks))
+            modified = _nal_to_nonref(frame_bytes, length_size)
+            copy_chunks.extend(modified)
+    copy_total = len(copy_chunks)
+
+    mdat_off, mdat_sz = _find_box(data, b"mdat")
+
+    # Build stts: real frames at original delta, fake at small delta
+    new_stts_body = struct.pack('>II', 0, 2)
+    new_stts_body += struct.pack('>II', real_count, last_delta)
+    new_stts_body += struct.pack('>II', fake_count, fake_delta)
+    new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
+
+    # Build stsz: repeat each real frame size 'multiplier' times
+    new_stsz_body = bytearray(20 + total_count * 4)
+    struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
+    idx = 0
+    for i in range(real_count):
+        for _ in range(multiplier):
+            struct.pack_into('>I', new_stsz_body, 12 + idx * 4, real_sizes[i])
+            idx += 1
+    new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
+
+    # stsc: each chunk has 1 sample
+    new_stsc_body = struct.pack('>II', 0, 1)
+    new_stsc_body += struct.pack('>III', 1, 1, 1)
+    new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
+
+    # Build stco with unique offsets
+    new_stco_body = bytearray(8 + total_count * 4)
+    struct.pack_into('>II', new_stco_body, 0, 0, total_count)
+    idx = 0
+    copy_idx = 0
+    for i in range(real_count):
+        struct.pack_into('>I', new_stco_body, 8 + idx * 4, real_offsets[i])
+        idx += 1
+        for _ in range(multiplier - 1):
+            copy_abs_off = mdat_off + mdat_sz + copy_offsets_rel[copy_idx]
+            struct.pack_into('>I', new_stco_body, 8 + idx * 4, copy_abs_off)
+            idx += 1
+            copy_idx += 1
+    new_stco = struct.pack('>I4s', 8 + len(new_stco_body), b'stco') + bytes(new_stco_body)
+
+    # DEBUG: Check stco body
+    import sys as _sys
+    print('DEBUG stco entries in new body:', file=_sys.stderr)
+    for _i in range(total_count):
+        _v = struct.unpack('>I', new_stco_body[8+_i*4:8+_i*4+4])[0]
+        print(f'  entry {_i}: {_v}', file=_sys.stderr)
+    print('DEBUG mdat_off:', mdat_off, 'mdat_sz:', mdat_sz, file=_sys.stderr)
+
+    # Replacements within moov
+    replacements = [
+        (stts_off, stts_sz, new_stts),
+        (stsz_off, stsz_sz, new_stsz),
+        (stsc_off, stsc_sz, new_stsc),
+        (stco_off, stco_sz, new_stco),
+    ]
+    replacements.sort(key=lambda x: x[0])
+    moov_delta = sum(len(new) - old_sz for _, old_sz, new in replacements)
+
+    total_result_len = len(data) + moov_delta + copy_total
+    result = bytearray(total_result_len)
+
+    read_pos = 0
+    write_pos = 0
+    for off, old_sz, new_bytes in replacements:
+        chunk = data[read_pos:off]
+        result[write_pos:write_pos + len(chunk)] = chunk
+        write_pos += len(chunk)
+        result[write_pos:write_pos + len(new_bytes)] = new_bytes
+        write_pos += len(new_bytes)
+        read_pos = off + old_sz
+    remaining = data[read_pos:]
+    result[write_pos:write_pos + len(remaining)] = remaining
+
+    # Append modified copy data after original mdat
+    copy_start = mdat_off + moov_delta + mdat_sz
+    result[copy_start:copy_start + copy_total] = copy_chunks
+
+    # Update mdat header size
+    new_mdat_sz = mdat_sz + copy_total
+    struct.pack_into('>I', result, copy_start - mdat_sz, new_mdat_sz)
+
+    # Update container sizes
+    for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
+        old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
+        struct.pack_into('>I', result, container_off, old_sz + moov_delta)
+
+    # Adjust all stco atoms by moov_delta
+    new_moov_end = moov_off + moov_sz + moov_delta
+    _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
+
+    # Update durations
+    total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
+    total_sec = total_stts_dur / 90000.0
+    mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, new_moov_end)
+    if mvhd_off != -1:
+        ver = result[mvhd_off+12]
+        if ver == 0:
+            mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
+            mvhd_dur = int(total_sec * mvhd_ts)
+            result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
+        else:
+            mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
+            mvhd_dur = int(total_sec * mvhd_ts)
+            result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
+
+    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, new_moov_end):
+        tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
+        if tkhd_off != -1:
+            ver = result[tkhd_off+12]
+            if ver == 0:
+                result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', mvhd_dur)
+            else:
+                result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', mvhd_dur)
+
+        mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off != -1:
+            mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+            if mdhd_off != -1:
+                ver = result[mdhd_off+12]
+                if ver == 0:
+                    mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
+                    mdhd_dur = int(total_sec * mdhd_ts)
+                    result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
+                else:
+                    mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
+                    mdhd_dur = int(total_sec * mdhd_ts)
+                    result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
+
+    return bytes(result)
 
 
 # ── Comment Udta Injection (meta/ilst, only \xa9cmt) ───────────────────
