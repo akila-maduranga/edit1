@@ -889,9 +889,13 @@ def move_moov_to_end(data):
         entry_count = int.from_bytes(new_data[idx+12:idx+16], 'big')
         off = idx + 16
         for _ in range(entry_count):
+            if off + 4 > len(new_data):
+                break
             old = int.from_bytes(new_data[off:off+4], 'big')
             new_off = old + shift
-            new_data[off:off+4] = struct.pack('>I', new_off)
+            # Ensure new offset is within valid range
+            if new_off >= 0:
+                new_data[off:off+4] = struct.pack('>I', new_off)
             off += 4
         pos = idx + 4  # continue searching
 
