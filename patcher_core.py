@@ -8,7 +8,7 @@ Pipeline:
    3. mvhd Fingerprint (zero dates)
    4. Udta Strip (remove ffmpeg encoder signature)
    5. Tkhd Fingerprint (zero alternate_group)
-   6. Frame Count Inflation (5x, two-entry stts, no filler NALs)
+   6. Frame Count Inflation (5x, multi-entry stts, interleaved, no filler NALs)
    7. Comment Udta Injection (Apple iTunes-style only)
    8. Restore original audio duration
 """
@@ -214,7 +214,35 @@ def strip_udta(data):
     return bytes(data)
 
 
-# ── Tkhd fingerprint ──────────────────────────────────────────────────
+# ── Tkhd fingerprint + zero all dates ─────────────────────────────────
+
+def zero_metadata_dates(data):
+    """Zero creation/modification dates in tkhd and mdhd throughout moov."""
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+    p = bytearray(data)
+    for trak_off, trak_sz, _ in _iter_boxes(p, moov_off+8, moov_off+moov_sz):
+        tkhd_off, _ = _find_box(p, b"tkhd", trak_off+8, trak_off+trak_sz)
+        if tkhd_off != -1:
+            ver = p[tkhd_off+8]
+            if ver == 0:
+                ct_off = tkhd_off + 12
+            else:
+                ct_off = tkhd_off + 20
+            if ct_off + 8 <= len(p):
+                struct.pack_into('>II', p, ct_off, 0, 0)
+        mdhd_off, _ = _find_box(p, b"mdhd", trak_off+8, trak_off+trak_sz)
+        if mdhd_off != -1:
+            ver = p[mdhd_off+8]
+            if ver == 0:
+                ct_off = mdhd_off + 12
+            else:
+                ct_off = mdhd_off + 20
+            if ct_off + 8 <= len(p):
+                struct.pack_into('>II', p, ct_off, 0, 0)
+    return bytes(p)
+
 
 def fingerprint_tkhd(data):
     """Zero out tkhd alternate_group to match TikTok source style."""
@@ -333,8 +361,8 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
 
 def inflate_sample_table_video(data, multiplier=5):
     """5x inflation by duplicating sample table entries (no filler NALs, no SPS patch).
-    Two-entry stts: real frames at original delta, fake frames at 1 tick (invisible).
-    Fake frames point to last real frame's data (no mdat modification).
+    Multi-entry stts: real frames at original delta, fake interleaved copies at 1 tick.
+    Interleaved layout: each real frame followed by multiplier-1 duplicates.
     Container durations set to match total stts sum.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
@@ -391,10 +419,11 @@ def inflate_sample_table_video(data, multiplier=5):
         total_count = min(real_count * multiplier, 0xFFFFFFFF)
         fake_count = total_count - real_count
 
-        # Two-entry stts: real frames at original delta, fake frames at 1 tick (invisible)
-        new_stts_body = struct.pack('>II', 0, 2)
-        new_stts_body += struct.pack('>II', real_count, last_delta)
-        new_stts_body += struct.pack('>II', fake_count, 1)
+        # Multi-entry stts: each group = 1 real frame at original delta + (multiplier-1) fake at 1 tick
+        new_stts_body = struct.pack('>II', 0, real_count * 2)
+        for _ in range(real_count):
+            new_stts_body += struct.pack('>II', 1, last_delta)
+            new_stts_body += struct.pack('>II', multiplier - 1, 1)
         new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
         uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
@@ -412,15 +441,14 @@ def inflate_sample_table_video(data, multiplier=5):
         if not real_offsets:
             return None
 
-        # Sequential: real frames first, then fake frames pointing to last real frame
+        # Interleaved: each real frame followed by multiplier-1 copies
         new_stsz_body = bytearray(20 + total_count * 4)
         struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
-        last_size = real_sizes[-1] if real_sizes else 0
-        last_off = real_offsets[-1] if real_offsets else 0
+        idx = 0
         for i in range(real_count):
-            struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
-        for i in range(fake_count):
-            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, last_size)
+            for _ in range(multiplier):
+                struct.pack_into('>I', new_stsz_body, 12 + idx * 4, real_sizes[i])
+                idx += 1
         new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
         new_stsc_body = struct.pack('>II', 0, 1)
@@ -430,10 +458,11 @@ def inflate_sample_table_video(data, multiplier=5):
         new_stco_count = total_count
         new_stco_body2 = bytearray(8 + new_stco_count * 4)
         struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
+        idx = 0
         for i in range(real_count):
-            struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
-        for i in range(fake_count):
-            struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, last_off)
+            for _ in range(multiplier):
+                struct.pack_into('>I', new_stco_body2, 8 + idx * 4, real_offsets[i])
+                idx += 1
         new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
         replacements = [
@@ -467,7 +496,7 @@ def inflate_sample_table_video(data, multiplier=5):
         new_moov_end = moov_off + moov_sz + moov_delta
         _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-        total_stts_dur = real_count * last_delta + fake_count * 1
+        total_stts_dur = real_count * (last_delta + (multiplier - 1) * 1)
         total_sec = total_stts_dur / 90000.0
         mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
         if mvhd_off != -1:
@@ -485,6 +514,9 @@ def inflate_sample_table_video(data, multiplier=5):
                 mvhd_dur = max(mvhd_dur, old_dur)
                 result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
 
+        trak_dur = 0
+        if 'mvhd_ts' in dir():
+            trak_dur = min(int(total_sec * mvhd_ts), 0xFFFFFFFF)
         for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
             # Only update video track durations
             mdia_off_v, mdia_sz_v = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
@@ -500,9 +532,9 @@ def inflate_sample_table_video(data, multiplier=5):
             if tkhd_off != -1:
                 ver = result[tkhd_off+12]
                 if ver == 0:
-                    result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', min(mvhd_dur, 0xFFFFFFFF))
+                    result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', trak_dur)
                 else:
-                    result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', mvhd_dur)
+                    result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', trak_dur)
 
             mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
             if mdia_off != -1:
@@ -757,6 +789,14 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         log_func(f"[READ] {len(data):,} bytes")
         _dump_atoms(data, "REBASE", log_func)
 
+    # ── Pass 1b: Zero all metadata dates ──────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 1b/7  Zero Metadata Dates ──────────────────────────────")
+    data = zero_metadata_dates(data)
+    if log_func:
+        log_func("[DATES] zeroed")
+
     # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ────────────────
     if log_func:
         log_func("")
@@ -795,7 +835,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, use_inflatio
         # ── Pass 6a: Frame Count Inflation ────────────────────────────
         if log_func:
             log_func("")
-            log_func("── 6/7  Frame Count Inflation (5x, two-entry stts, no filler NALs) ─────────────")
+            log_func("── 6/7  Frame Count Inflation (5x, multi-entry stts, interleaved) ─────────────────")
         inflated = inflate_sample_table_video(data, multiplier=5)
         if inflated is None:
             if log_func:
