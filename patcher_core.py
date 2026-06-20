@@ -248,7 +248,7 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count, entry_size
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=5, filler_type='nal'):
+def inflate_sample_table_video(data, multiplier=10, filler_type='nal'):
     """Inflation — add fake frames to prevent TikTok re-encode.
     filler_type='nal': append H.264 filler NALs (512 bytes, fake_delta=750).
     filler_type='lastcopy': append copies of last real frame data (valid picture, fake_delta=750).
@@ -977,7 +977,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
         if log_func:
             log_func("")
             log_func("── 5/7  Frame Count Inflation (5x, sequential, two-entry stts) ────────────────")
-        inflated = inflate_sample_table_video(data, multiplier=5)
+        inflated = inflate_sample_table_video(data, multiplier=10)
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
@@ -1038,7 +1038,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
 
 
 TIKQUICK_ENCODE_ARGS = [
-    "-vf", "fps=400,scale=1920:1080,setdar=9/16,setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
+    "-vf", "fps=10000,scale=1920:1080,setdar=9/16,setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
     "-c:v", "libx264", "-preset", "slow", "-crf", "18",
     "-maxrate", "40M", "-bufsize", "40M",
     "-pix_fmt", "yuv420p",
