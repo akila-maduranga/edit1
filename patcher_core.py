@@ -566,48 +566,12 @@ def inflate_sample_table_video(data, multiplier=10):
     if moov_off < mdat_off:
         _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-    # Set mvhd/tkhd/mdhd durations to inflated value (prevents TikTok
-    # duration-doubling bug).  Total duration = real_count * real_delta
-    # stays the same; we multiply the declared movie timescale duration
-    # so it's consistent with the inflated stsz count.
-    original_ticks = real_count * real_delta
-    inflated_ticks = total_count * real_delta
-    original_sec = original_ticks / 90000.0
-    inflated_sec = inflated_ticks / 90000.0
-
-    mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
-    if mvhd_off != -1:
-        ver = result[mvhd_off+8]
-        if ver == 0:
-            mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
-            result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', int(inflated_sec * mvhd_ts))
-        else:
-            mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
-            result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', int(inflated_sec * mvhd_ts))
-
-    # Video track tkhd + mdhd
-    if video_trak_off is not None:
-        tkhd_off, _ = _find_box(result, b"tkhd", video_trak_off+8, video_trak_off+trak_sz+moov_delta)
-        if tkhd_off != -1:
-            ver = result[tkhd_off+8]
-            if ver == 0:
-                tkhd_ts = int.from_bytes(result[tkhd_off+28:tkhd_off+32], 'big')
-                result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', int(inflated_sec * tkhd_ts))
-            else:
-                tkhd_ts = int.from_bytes(result[tkhd_off+36:tkhd_off+40], 'big')
-                result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', int(inflated_sec * tkhd_ts))
-
-        v_mdia_off, v_mdia_sz = _find_box(result, b"mdia", video_trak_off+8, video_trak_off+trak_sz+moov_delta)
-        if v_mdia_off != -1:
-            mdhd_off, _ = _find_box(result, b"mdhd", v_mdia_off+8, v_mdia_off+v_mdia_sz)
-            if mdhd_off != -1:
-                ver = result[mdhd_off+8]
-                if ver == 0:
-                    mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
-                    result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', int(inflated_sec * mdhd_ts))
-                else:
-                    mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
-                    result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', int(inflated_sec * mdhd_ts))
+    # NOTE: We intentionally do NOT modify mvhd/tkhd/mdhd durations here.
+    # The original code had wrong field offsets (e.g. tkhd has no timescale
+    # field — it uses the movie timescale; mdhd timescale is at +20 not +24)
+    # which corrupted box headers and made files unopenable.
+    # Duration inflation can be re-added later with correct offsets if needed.
+    # The stsz inflation alone is sufficient for the TikTok bypass.
 
     return bytes(result)
 
