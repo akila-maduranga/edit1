@@ -635,9 +635,9 @@ def patch_ftyp(data):
     ftyp_off, ftyp_sz = _find_box(result, b"ftyp")
     if ftyp_off == -1:
         return data
-    # Major brand -> M4VH, change last compat to isom
+    # Major brand -> M4VH, overwrite last compat brand with isom
     result[ftyp_off+8:ftyp_off+12] = b'M4VH'
-    result[ftyp_off+28:ftyp_off+32] = b'isom'
+    result[ftyp_off+ftyp_sz-4:ftyp_off+ftyp_sz] = b'isom'
     return bytes(result)
 
 
