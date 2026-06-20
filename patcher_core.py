@@ -1,4 +1,5 @@
 import struct
+from pathlib import Path
 
 # ==========================================
 # MP4 Box Parser & Writer
@@ -447,13 +448,18 @@ def reloov_end(data):
 # ==========================================
 def patch_all(data, loop_count=10, **kwargs):
     """Applies all patches to raw bytes data. Accepts **kwargs for compatibility."""
+    # Handle PosixPath or string paths being passed instead of bytes
+    if isinstance(data, (str, Path)):
+        with open(data, 'rb') as f:
+            data = f.read()
+            
     data = inflate_sample_table_video(data, loop_count)
     data = reloov_end(data)
     return data
 
 def tikquick_encode(input_data, loop_count=10, **kwargs):
     """Wrapper expected by the main script. Accepts file path or bytes."""
-    if isinstance(input_data, str):
+    if isinstance(input_data, (str, Path)):
         with open(input_data, 'rb') as f:
             data = f.read()
     else:
