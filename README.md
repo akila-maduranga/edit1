@@ -1,61 +1,66 @@
 # TikTok MP4 Patcher
 
-Self-hosted VPS tool that remuxes MP4 files and applies a binary structural
-patch to bypass TikTok's aggressive compression on re-uploaded content.
+Frame-count inflation tool that prevents TikTok from re-encoding uploaded
+videos by making the encoder see an unusually high frame count.
 
-## What it does
+## How it works
 
-**Step 1 — Remux (stream copy)**  
-Runs `ffmpeg -c copy -movflags +faststart` — no re-encoding, just moves the
-`moov` atom to the front so the binary patch can reliably locate all boxes.
+TikTok's encoder skips re-encoding when it encounters a frame count well
+above its expected range. This tool inflates the video track's sample table
+(stts/stsz/stco) by 5×, appending H.264 filler NALs to the mdat box so
+each fake frame has valid (but empty) data. The encoder passes the file
+through without re-encoding.
 
-**Step 2 — ftyp patch**  
-Rewrites the `ftyp` box: major brand → `mp42`, compatible brands →
-`[isom, iso2, avc1, mp41]`. TikTok's ingest pipeline checks this field to
-detect re-encoded/re-muxed content.
+**Trade-off:** The inflated stts table adds ~31s of frozen-last-frame at
+the end of a 16s video (freeze ≈ real_duration × 2). This is inherent to
+the approach — TikTok always plays all stts entries.
 
-**Step 3 — mvhd flag clear**  
-Clears the random-access flag bit in the `mvhd` (movie header) box.
-TikTok uses this to identify files that have passed through a muxer.
+## Pipeline
+
+1. **moov relocate** — moves moov atom to front of file (Python-based,
+   no ffmpeg dependency for remux)
+2. **mvhd fingerprint** — randomizes creation/modification times and
+   next_track_id to break surface-level fingerprints
+3. **udta strip** — removes ffmpeg/HandBrake encoder tags from user-data
+4. **tkhd fingerprint** — sets alternate_group to avoid track dedup
+5. **Frame inflation** — 5× sample table expansion with 512B NAL filler,
+   fake_delta=750, container durations clipped to real content
+6. **Comment injection** — embeds iTunes-style metadata comment
+7. **Audio duration fix** — restores original audio track duration
 
 ## Requirements
 
 - Python 3.10+
-- `ffmpeg` on PATH (`apt install ffmpeg` on Debian/Ubuntu)
-- Flask 3.x
+- `ffmpeg` on PATH (for `app.py` remux only; CLI works without it)
 
-## Quick start
+## Quick start (CLI)
 
 ```bash
-git clone <repo> /opt/tiktok-patcher
-cd /opt/tiktok-patcher
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python app.py          # http://0.0.0.0:5000
+python patcher.py input.mp4 -o output.mp4 --inflate
 ```
 
-## VPS deployment
+Flags:
+- `--inflate` — enable frame-count inflation (required for no-compress)
+- `--comment` — set metadata comment (default: `@akila`)
+- `-o` — output path (default: `patched_output.mp4`)
 
-1. Copy files to `/opt/tiktok-patcher`
-2. Copy `tiktok-patcher.service` to `/etc/systemd/system/`
-3. Copy `nginx.conf` to `/etc/nginx/sites-available/tiktok-patcher`
-4. Enable and start:
+## Quick start (Web UI)
 
 ```bash
-systemctl enable --now tiktok-patcher
-ln -s /etc/nginx/sites-available/tiktok-patcher /etc/nginx/sites-enabled/
-nginx -t && systemctl reload nginx
+pip install -r requirements.txt
+python app.py          # http://0.0.0.0:5000
 ```
 
 ## File layout
 
 ```
-app.py                   # Flask app + patcher logic
-templates/index.html     # Single-page UI
+patcher_core.py          # Core binary patching engine
+patcher.py               # CLI entry point
+app.py                   # Flask web UI
+templates/index.html     # Single-page upload UI
 uploads/                 # Temp upload dir (auto-cleaned)
 outputs/                 # Patched files (served for download)
 requirements.txt
-tiktok-patcher.service   # systemd unit
-nginx.conf               # Nginx reverse-proxy snippet
+tiktok-patcher.service   # systemd unit (VPS)
+nginx.conf               # Nginx reverse-proxy snippet (VPS)
 ```
