@@ -248,14 +248,152 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count, entry_size
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=5, filler_type='nal', keep_tables=False):
-    """Inflation — add fake frames to prevent TikTok re-encode.
-    filler_type='nal': append H.264 filler NALs (512 bytes, fake_delta=750).
-    filler_type='lastcopy': append copies of last real frame data (valid picture, fake_delta=750).
-    filler_type='zero': zero-size frames, fake_delta=1.
-    keep_tables=True: keep original stco/stsc unchanged (minimal approach).
-    Container durations clipped to real frames only.
+
+# ── Edts/Elst Rebuild (ZeroLoss Track Bypass) ─────────────────────────
+
+def build_edts_atom(duration, media_time=0):
+    elst_size = 36 if duration > 0xffffffff else 28
+    edts_size = 8 + elst_size
+    buf = bytearray(edts_size)
+    struct.pack_into('>I4s', buf, 0, edts_size, b'edts')
+    struct.pack_into('>I4s', buf, 8, elst_size, b'elst')
+    if duration > 0xffffffff:
+        struct.pack_into('>I', buf, 16, 0x01000000)
+        struct.pack_into('>I', buf, 20, 1)
+        struct.pack_into('>Q', buf, 24, duration)
+        struct.pack_into('>q', buf, 32, media_time)
+        struct.pack_into('>I', buf, 40, 0x00010000)
+    else:
+        struct.pack_into('>I', buf, 16, 0)
+        struct.pack_into('>I', buf, 20, 1)
+        struct.pack_into('>I', buf, 24, duration)
+        struct.pack_into('>i', buf, 28, media_time)
+        struct.pack_into('>I', buf, 32, 0x00010000)
+    return bytes(buf)
+
+
+def rebuild_elst_bypass(data):
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+    data = bytearray(data)
+    modifications = []
+    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+        tkhd_off, _ = _find_box(data, b"tkhd", trak_off+8, trak_off+trak_sz)
+        if tkhd_off == -1:
+            continue
+        version = data[tkhd_off+8]
+        if version == 1:
+            duration = int.from_bytes(data[tkhd_off+36:tkhd_off+44], 'big')
+        else:
+            duration = int.from_bytes(data[tkhd_off+28:tkhd_off+32], 'big')
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+        media_time = 0
+        if mdhd_off != -1:
+            v = data[mdhd_off+8]
+            ts_off = mdhd_off + (24 if v == 0 else 32)
+            timescale = int.from_bytes(data[ts_off:ts_off+4], 'big')
+            if timescale == 90000:
+                media_time = 6000
+        edts_bytes = build_edts_atom(duration, media_time)
+        edts_off, edts_sz = _find_box(data, b"edts", trak_off+8, trak_off+trak_sz)
+        if edts_off != -1:
+            modifications.append((edts_off, edts_sz, edts_bytes, trak_off))
+        else:
+            modifications.append((mdia_off, 0, edts_bytes, trak_off))
+    modifications.sort(key=lambda x: x[0])
+    if not modifications:
+        return bytes(data)
+    total_delta = sum(len(m[2]) - m[1] for m in modifications)
+    new_data = bytearray(len(data) + total_delta)
+    read_pos = 0
+    write_pos = 0
+    for off, old_sz, new_bytes, trak_off in modifications:
+        new_data[write_pos:write_pos + off - read_pos] = data[read_pos:off]
+        write_pos += off - read_pos
+        new_data[write_pos:write_pos + len(new_bytes)] = new_bytes
+        write_pos += len(new_bytes)
+        read_pos = off + old_sz
+    new_data[write_pos:] = data[read_pos:]
+    cum_delta = 0
+    i = 0
+    while i < len(modifications):
+        off, old_sz, new_bytes, trak_off = modifications[i]
+        this_delta = len(new_bytes) - old_sz
+        j = i + 1
+        while j < len(modifications) and modifications[j][3] == trak_off:
+            this_delta += len(modifications[j][2]) - modifications[j][1]
+            j += 1
+        effective_off = trak_off + cum_delta
+        orig_sz = int.from_bytes(new_data[effective_off:effective_off+4], 'big')
+        struct.pack_into('>I', new_data, effective_off, orig_sz + this_delta)
+        cum_delta += this_delta
+        i = j
+    moov_sz = int.from_bytes(new_data[moov_off:moov_off+4], 'big')
+    struct.pack_into('>I', new_data, moov_off, moov_sz + total_delta)
+    _adjust_stco(new_data, total_delta, moov_off+8, moov_off+8+moov_sz+total_delta)
+    return bytes(new_data)
+
+
+# ── AvcC/SPS Patching (profile High10, level 6.2) ────────────────────
+
+def _patch_avcC_sps(data):
+    moov_off, moov_sz = _find_box(data, b"moov")
+    if moov_off == -1:
+        return data
+    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
+            continue
+        minf_off, minf_sz = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        if minf_off == -1:
+            continue
+        stbl_off, stbl_sz = _find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        if stbl_off == -1:
+            continue
+        stsd_off, _ = _find_box(data, b"stsd", stbl_off+8, stbl_off+stbl_sz)
+        if stsd_off == -1:
+            continue
+        stsd_end = stsd_off + int.from_bytes(data[stsd_off:stsd_off+4], 'big')
+        entry_count = int.from_bytes(data[stsd_off+8:stsd_off+12], 'big')
+        pos = stsd_off + 12
+        for _ in range(entry_count):
+            if pos + 8 > stsd_end:
+                break
+            e_sz = int.from_bytes(data[pos:pos+4], 'big')
+            e_type = data[pos+4:pos+8]
+            if e_type in (b'avc1', b'avc3'):
+                avcC_off, _ = _find_box(data, b'avcC', pos+8, pos+e_sz)
+                if avcC_off == -1:
+                    continue
+                p = bytearray(data)
+                p[avcC_off+9] = 110
+                p[avcC_off+10] = 0
+                p[avcC_off+11] = 62
+                sps_start = avcC_off + 16
+                if sps_start + 3 < len(p):
+                    p[sps_start+1] = 110
+                    p[sps_start+3] = 62
+                return bytes(p)
+            pos += e_sz
+    return data
+
+
+# ── Frame Count Inflation (5x, filler NALs, full table rebuild) ──────
+
+def inflate_sample_table_video(data, multiplier=5):
+    """5x inflation: original approach with filler NALs, full table rebuild.
+    Real frames at original delta, filler at delta=750.
+    Container durations match total stts duration.
     """
+    data = _patch_avcC_sps(data)
+
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
@@ -289,14 +427,6 @@ def inflate_sample_table_video(data, multiplier=5, filler_type='nal', keep_table
     stbl_off, stbl_sz, trak_off, mdia_off, minf_off = video_stbl
     stbl_end = stbl_off + stbl_sz
 
-    mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, trak_off + int.from_bytes(data[trak_off:trak_off+4], 'big'))
-    if mdhd_off != -1:
-        ver = data[mdhd_off+8]
-        ts_off = mdhd_off + (20 if ver == 0 else 28)
-        video_timescale = int.from_bytes(data[ts_off:ts_off+4], 'big')
-    else:
-        video_timescale = 90000
-
     stts_off, stts_sz = _find_box(data, b"stts", stbl_off+8, stbl_end)
     stsz_off, stsz_sz = _find_box(data, b"stsz", stbl_off+8, stbl_end)
     stco_off, stco_sz = _find_box(data, b"stco", stbl_off+8, stbl_end)
@@ -310,213 +440,162 @@ def inflate_sample_table_video(data, multiplier=5, filler_type='nal', keep_table
     if -1 in (stts_off, stsz_off, stco_off, stsc_off):
         return None
 
-    try:
-        stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
-        real_count = 0
-        orig_total_dur_ticks = 0
-        orig_last_delta = 0
-        for i in range(stts_entry_count):
-            off = stts_off + 16 + i * 8
-            cnt = int.from_bytes(data[off:off+4], 'big')
-            d = int.from_bytes(data[off+4:off+8], 'big')
-            real_count += cnt
-            orig_total_dur_ticks += cnt * d
-            orig_last_delta = d
+    stts_entry_count = int.from_bytes(data[stts_off+12:stts_off+16], 'big')
+    real_count = 0
+    last_delta = 0
+    orig_total_dur_ticks = 0
+    for i in range(stts_entry_count):
+        off = stts_off + 16 + i * 8
+        cnt = int.from_bytes(data[off:off+4], 'big')
+        d = int.from_bytes(data[off+4:off+8], 'big')
+        real_count += cnt
+        last_delta = d
+        orig_total_dur_ticks += cnt * d
 
-        if real_count == 0:
-            return None
+    if real_count == 0:
+        return None
 
-        total_count = min(int(real_count * multiplier), 0xFFFFFFFF)
-        fake_count = total_count - real_count
+    orig_stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
+    total_count = min(int(real_count * multiplier), 0xFFFFFFFF)
+    fake_count = total_count - real_count
+    fake_delta = 750
 
-        real_offsets = _sample_offsets(data, stco_off, stsc_off, stsz_off, real_count, co_entry_size)
-        if not real_offsets:
-            return None
+    # stts: 2 entries — real at last_delta, fake at fake_delta=750
+    new_stts_body = struct.pack('>II', 0, 2)
+    new_stts_body += struct.pack('>II', real_count, last_delta)
+    new_stts_body += struct.pack('>II', fake_count, fake_delta)
+    new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
-        uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
-        orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
-        real_sizes = []
-        for i in range(real_count):
-            if uniform_size != 0:
-                real_sizes.append(uniform_size)
-            elif i < orig_stsz_count:
-                real_sizes.append(int.from_bytes(data[stsz_off+20+i*4:stsz_off+24+i*4], 'big'))
-            else:
-                real_sizes.append(uniform_size if uniform_size else 0)
+    # Filler NAL data
+    FILLER_NAL_SIZE = 512
+    filler_frame = b'\x00\x00\x00\x01\x0c\x80' + b'\x00' * (FILLER_NAL_SIZE - 6)
+    filler_data = filler_frame * fake_count
 
-        if filler_type == 'lastcopy':
-            last_sz = real_sizes[-1]
-            last_off = real_offsets[-1]
-            last_frame_data = data[last_off:last_off + last_sz]
-            filler_data = last_frame_data * fake_count
-            fake_sz = last_sz
-            fake_delta = 750
-            mdat_extension = len(filler_data)
-            fill_off = mdat_off + mdat_sz
-        elif filler_type == 'nal':
-            FILLER_NAL_SZ = 512
-            nal_body_len = FILLER_NAL_SZ - 4
-            fake_frame = struct.pack('>I', nal_body_len) + b'\x0c' + b'\x00' * (nal_body_len - 1)
-            filler_data = fake_frame * fake_count
-            fake_sz = FILLER_NAL_SZ
-            fake_delta = 750
-            mdat_extension = len(filler_data)
-            fill_off = mdat_off + mdat_sz
+    # Read real frame sizes
+    orig_stsz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
+    uniform_size = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
+    real_offsets = _sample_offsets(data, stco_off, stsc_off, stsz_off, real_count, co_entry_size)
+    if not real_offsets:
+        return None
+
+    real_sizes = []
+    for i in range(real_count):
+        if uniform_size != 0:
+            real_sizes.append(uniform_size)
+        elif i < orig_stsz_count:
+            real_sizes.append(int.from_bytes(data[stsz_off+20+i*4:stsz_off+24+i*4], 'big'))
         else:
-            filler_data = b''
-            fake_sz = 0
-            fake_delta = 1
-            mdat_extension = 0
-            fill_off = 0
+            real_sizes.append(uniform_size if uniform_size else 0)
 
-        if keep_tables:
-            filler_data = b''
-            fake_sz = 0
-            mdat_extension = 0
+    # Non-interleaved stsz: all real, then all filler
+    new_stsz_body = bytearray(20 + total_count * 4)
+    struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
+    for i in range(real_count):
+        struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
+    for i in range(fake_count):
+        struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, FILLER_NAL_SIZE)
+    new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
-        fake_dur_ticks = fake_count * fake_delta
+    # stsc: all chunks have 1 sample
+    new_stsc_body = struct.pack('>II', 0, 1)
+    new_stsc_body += struct.pack('>III', 1, 1, 1)
+    new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
 
-        if keep_tables:
-            avg_delta = max(int(orig_total_dur_ticks / real_count), 1)
-            dur_for_containers = total_count * avg_delta / video_timescale
-            new_stts_body = struct.pack('>II', 0, 2)
-            new_stts_body += struct.pack('>II', real_count, avg_delta)
-            new_stts_body += struct.pack('>II', fake_count, avg_delta)
+    # Non-interleaved stco: all real offsets, then all filler offsets
+    new_stco_count = total_count
+    new_stco_body2 = bytearray(8 + new_stco_count * 4)
+    struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
+    for i in range(real_count):
+        struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
+    for i in range(fake_count):
+        pos = mdat_off + mdat_sz + i * FILLER_NAL_SIZE
+        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
+    new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
+
+    replacements = [
+        (stts_off, stts_sz, new_stts),
+        (stsz_off, stsz_sz, new_stsz),
+        (stsc_off, stsc_sz, new_stsc),
+        (stco_off, stco_sz, new_stco2),
+    ]
+    replacements.sort(key=lambda x: x[0])
+
+    stts_delta = len(new_stts) - stts_sz
+    stsz_delta = len(new_stsz) - stsz_sz
+    stsc_delta = len(new_stsc) - stsc_sz
+    stco_delta = len(new_stco2) - stco_sz
+    moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
+    new_size = len(data) + moov_delta
+    result = bytearray(new_size)
+
+    read_pos = 0
+    write_pos = 0
+    for off, old_sz, new_bytes in replacements:
+        result[write_pos:write_pos + off - read_pos] = data[read_pos:off]
+        write_pos += off - read_pos
+        result[write_pos:write_pos + len(new_bytes)] = new_bytes
+        write_pos += len(new_bytes)
+        read_pos = off + old_sz
+    result[write_pos:write_pos + len(data) - read_pos] = data[read_pos:]
+
+    for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
+        old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
+        struct.pack_into('>I', result, container_off, old_sz + moov_delta)
+
+    new_moov_end = moov_off + moov_sz + moov_delta
+    _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
+
+    # Extend mdat with filler NALs and update mdat header
+    result.extend(filler_data)
+    struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + len(filler_data))
+
+    # Container durations match total stts (prevents freeze)
+    total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
+    total_sec = total_stts_dur / 90000.0
+    mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, new_moov_end)
+    if mvhd_off != -1:
+        ver = result[mvhd_off+8]
+        if ver == 0:
+            mvhd_ts = int.from_bytes(result[mvhd_off+24:mvhd_off+28], 'big')
+            mvhd_dur = int(total_sec * mvhd_ts)
+            result[mvhd_off+28:mvhd_off+32] = struct.pack('>I', mvhd_dur)
         else:
-            dur_for_containers = orig_total_dur_ticks / video_timescale
-            new_stts_body = struct.pack('>II', 0, 2)
-            new_stts_body += struct.pack('>II', real_count, orig_last_delta)
-            new_stts_body += struct.pack('>II', fake_count, fake_delta)
-        new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
+            mvhd_ts = int.from_bytes(result[mvhd_off+32:mvhd_off+36], 'big')
+            mvhd_dur = int(total_sec * mvhd_ts)
+            result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
 
-        new_stsz_body = bytearray(20 + total_count * 4)
-        struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
-        for i in range(real_count):
-            struct.pack_into('>I', new_stsz_body, 12 + i * 4, real_sizes[i])
-        for i in range(fake_count):
-            struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, fake_sz)
-        new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
-
-        replacements = [
-            (stts_off, stts_sz, new_stts),
-            (stsz_off, stsz_sz, new_stsz),
-        ]
-        if not keep_tables:
-            new_stsc_body = struct.pack('>II', 0, 1)
-            new_stsc_body += struct.pack('>III', 1, 1, 1)
-            new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
-
-            new_stco_body2 = bytearray(8 + total_count * 4)
-            struct.pack_into('>II', new_stco_body2, 0, 0, total_count)
-            for i in range(real_count):
-                struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
-            for i in range(fake_count):
-                off = fill_off + i * fake_sz
-                struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, off)
-            new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
-            replacements.extend([
-                (stsc_off, stsc_sz, new_stsc),
-                (stco_off, stco_sz, new_stco2),
-            ])
-        replacements.sort(key=lambda x: x[0])
-
-        moov_delta = sum(len(new) - old_sz for _, old_sz, new in replacements)
-
-        result = bytearray(len(data) + moov_delta + mdat_extension)
-        read_pos = 0
-        write_pos = 0
-        for off, old_sz, new_bytes in replacements:
-            result[write_pos:write_pos + off - read_pos] = data[read_pos:off]
-            write_pos += off - read_pos
-            result[write_pos:write_pos + len(new_bytes)] = new_bytes
-            write_pos += len(new_bytes)
-            read_pos = off + old_sz
-        rest_len = len(data) - read_pos
-        result[write_pos:write_pos + rest_len] = data[read_pos:read_pos + rest_len]
-        write_pos += rest_len
-
-        if filler_data:
-            result[write_pos:write_pos + len(filler_data)] = filler_data
-            write_pos += len(filler_data)
-            new_mdat_sz = mdat_sz + len(filler_data)
-            mdat_offset_adjusted = mdat_off + moov_delta
-            struct.pack_into('>I', result, mdat_offset_adjusted, new_mdat_sz)
-
-        for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
-            old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
-            new_sz = max(old_sz + moov_delta, 8)
-            if new_sz > 0xFFFFFFFF:
-                new_sz = 0xFFFFFFFF
-            struct.pack_into('>I', result, container_off, new_sz)
-
-        new_moov_end = moov_off + moov_sz + moov_delta
-        _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
-
-        mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
-        if mvhd_off != -1:
-            ver = result[mvhd_off+8]
+    trak_dur = mvhd_dur
+    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, new_moov_end):
+        tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
+        if tkhd_off != -1:
+            ver = result[tkhd_off+8]
             if ver == 0:
-                mvhd_ts = int.from_bytes(result[mvhd_off+20:mvhd_off+24], 'big')
-                mvhd_dur = min(int(dur_for_containers * mvhd_ts), 0xFFFFFFFF)
-                result[mvhd_off+24:mvhd_off+28] = struct.pack('>I', mvhd_dur)
-                mvhd_ts_used = mvhd_ts
+                result[tkhd_off+32:tkhd_off+36] = struct.pack('>I', trak_dur)
             else:
-                mvhd_ts = int.from_bytes(result[mvhd_off+28:mvhd_off+32], 'big')
-                mvhd_dur = int(dur_for_containers * mvhd_ts)
-                result[mvhd_off+32:mvhd_off+40] = struct.pack('>Q', mvhd_dur)
-                mvhd_ts_used = mvhd_ts
+                result[tkhd_off+44:tkhd_off+52] = struct.pack('>Q', trak_dur)
 
-        trak_dur = min(int(dur_for_containers * mvhd_ts_used), 0xFFFFFFFF)
-        for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
-            mdia_off_v, mdia_sz_v = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
-            is_video = False
-            if mdia_off_v != -1:
-                hdlr_off, _ = _find_box(result, b"hdlr", mdia_off_v+8, mdia_off_v+mdia_sz_v)
-                if hdlr_off != -1 and result[hdlr_off+16:hdlr_off+20] == b'vide':
-                    is_video = True
-            if not is_video:
-                continue
-            tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
-            if tkhd_off != -1:
-                ver = result[tkhd_off+8]
-                if ver == 0:
-                    result[tkhd_off+28:tkhd_off+32] = struct.pack('>I', trak_dur)
-                else:
-                    result[tkhd_off+36:tkhd_off+44] = struct.pack('>Q', trak_dur)
-            mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
-            if mdia_off != -1:
-                mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
-                if mdhd_off != -1:
-                    ver = result[mdhd_off+8]
-                    if ver == 0:
-                        mdhd_ts = int.from_bytes(result[mdhd_off+20:mdhd_off+24], 'big')
-                        mdhd_dur = min(int(dur_for_containers * mdhd_ts), 0xFFFFFFFF)
-                        result[mdhd_off+24:mdhd_off+28] = struct.pack('>I', mdhd_dur)
-                    else:
-                        mdhd_ts = int.from_bytes(result[mdhd_off+28:mdhd_off+32], 'big')
-                        mdhd_dur = int(dur_for_containers * mdhd_ts)
-                        result[mdhd_off+32:mdhd_off+40] = struct.pack('>Q', mdhd_dur)
+        mdia_off, _ = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
+        if mdia_off == -1:
+            continue
+        hdlr_off, _ = _find_box(result, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        if hdlr_off == -1:
+            continue
+        mdhd_off, _ = _find_box(result, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+        if mdhd_off == -1:
+            continue
+        is_video = result[hdlr_off+16:hdlr_off+20] == b'vide'
+        ver = result[mdhd_off+8]
+        if is_video:
+            if ver == 0:
+                mdhd_ts = int.from_bytes(result[mdhd_off+24:mdhd_off+28], 'big')
+                mdhd_dur = int(total_sec * mdhd_ts)
+                result[mdhd_off+28:mdhd_off+32] = struct.pack('>I', mdhd_dur)
+            else:
+                mdhd_ts = int.from_bytes(result[mdhd_off+32:mdhd_off+36], 'big')
+                mdhd_dur = int(total_sec * mdhd_ts)
+                result[mdhd_off+36:mdhd_off+44] = struct.pack('>Q', mdhd_dur)
 
-        return bytes(result)
-    except (struct.error, ValueError, OverflowError, RuntimeError) as _exc:
-        import traceback, sys
-        _tb = traceback.format_exc()
-        _msg = [f"[INFLATE ERROR] {type(_exc).__name__}: {_exc}"]
-        _locs = locals()
-        for _k in ('real_count','last_delta','total_count','new_delta','moov_delta',
-                   'stbl_sz','minf_sz','mdia_sz','trak_sz','moov_off','moov_sz',
-                   'mvhd_dur','new_sz'):
-            if _k in _locs:
-                _msg.append(f"  {_k}={_locs[_k]}")
-        if 'real_sizes' in _locs and _locs['real_sizes']:
-            _msg.append(f"  real_sizes len={len(_locs['real_sizes'])}, max={max(_locs['real_sizes'])}")
-        if 'real_offsets' in _locs and _locs['real_offsets']:
-            _msg.append(f"  real_offsets len={len(_locs['real_offsets'])}, max={max(_locs['real_offsets'])}")
-        for _line in _tb.splitlines():
-            _msg.append(f"  {_line}")
-        sys.stderr.write("\n".join(_msg) + "\n")
-        sys.stderr.flush()
-        raise RuntimeError("\n".join(_msg)) from None
+    return bytes(result)
 
 
 # ── Comment Udta Injection (meta/ilst, only \xa9cmt) ───────────────────
@@ -876,8 +955,8 @@ def add_balanced_sync_elst(data, multiplier=2):
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
 def patch_all(input_path, output_path, comment=None, log_func=None, method='balanced-sync', use_inflation=None):
-    """8-pass pipeline. Inflation runs last (Pass 8) so all other modifications
-    (codec spoofing, fingerprinting, comment, audio restore) are applied first."""
+    """9-pass pipeline. Inflation runs last (Pass 9) so all other modifications
+    (elst bypass, fingerprinting, codec spoofing, comment, audio restore) are applied first."""
     if use_inflation is not None:
         if use_inflation:
             method = 'inflate'
@@ -915,7 +994,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
     # ── Pass 1: Move moov to front (pure Python, preserves all metadata) ──
     if log_func:
         log_func("")
-        log_func("── 1/8  Python reloov (moov to front) ─────────────────────")
+        log_func("── 1/9  Python reloov (moov to front) ─────────────────────")
     data = bytearray(original_data)
     ftyp_off, ftyp_sz = _find_box(data, b"ftyp")
     moov_off, moov_sz = _find_box(data, b"moov")
@@ -964,63 +1043,70 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
 
 
 
-    # ── Pass 2: mvhd Fingerprint ────────────────────────────────────────
+    # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ─────────────
     if log_func:
         log_func("")
-        log_func("── 2/8  mvhd Fingerprint (next_track_id=9999, fixed date) ──")
+        log_func("── 2/9  ZeroLoss Track Bypass (edts/elst) ─────────────────")
+    data = rebuild_elst_bypass(data)
+    if log_func:
+        log_func("[ELST] done")
+
+    # ── Pass 3: mvhd Fingerprint ────────────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 3/9  mvhd Fingerprint (next_track_id=9999, fixed date) ──")
     data = patch_mvhd_fingerprint(data)
     if log_func:
         log_func("[MVHD] done")
 
-    # ── Pass 3: Udta Strip (remove ffmpeg encoder tag) ──────────────────
+    # ── Pass 4: Udta Strip (remove ffmpeg encoder tag) ──────────────────
     if log_func:
         log_func("")
-        log_func("── 3/8  Udta Strip ─────────────────────────────────────────")
+        log_func("── 4/9  Udta Strip ─────────────────────────────────────────")
     data = strip_udta(data)
     if log_func:
         log_func("[UDTA] done")
 
-    # ── Pass 4: tkhd Fingerprint ────────────────────────────────────────
+    # ── Pass 5: tkhd Fingerprint ────────────────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 4/8  tkhd Fingerprint (alternate_group) ────────────────")
+        log_func("── 5/9  tkhd Fingerprint (alternate_group) ────────────────")
     data = fingerprint_tkhd(data)
     if log_func:
         log_func("[TKHD] done")
 
-    # ── Pass 5: Codec Spoofing (for all methods) ─────────────────────────
+    # ── Pass 6: Codec Spoofing (for all methods) ─────────────────────────
     if log_func:
         log_func("")
-        log_func("── 5/8  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
+        log_func("── 6/9  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
     data = patch_stsd_codec(data)
     data = patch_ftyp(data)
     if log_func:
         log_func("[CODEC] done")
 
-    # ── Pass 6: Comment Udta Injection ──────────────────────────────────
+    # ── Pass 7: Comment Udta Injection ──────────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 6/8  Comment Udta Injection ────────────────────────────")
+        log_func("── 7/9  Comment Udta Injection ────────────────────────────")
     data = inject_comment_udta(data, final_comment)
     if log_func:
         log_func(f"[COMMENT] injected ({final_comment!r})")
 
-    # ── Pass 7: Restore original audio duration ─────────────────────────
+    # ── Pass 8: Restore original audio duration ─────────────────────────
     if log_func:
         log_func("")
-        log_func("── 7/8  Audio Duration Restore ────────────────────────────")
+        log_func("── 8/9  Audio Duration Restore ────────────────────────────")
     data = patch_audio_duration(data, original_audio_dur)
     if log_func:
         log_func("[AUDIO] done")
 
-    # ── Pass 8: Bypass Method (Inflation / Balanced Sync) ───────────────
-    # Inflation runs LAST so all other modifications (fingerprinting, codec
-    # spoof, comment, audio restore) are applied first.
+    # ── Pass 9: Bypass Method (Inflation / Balanced Sync) ───────────────
+    # Inflation runs LAST. _patch_avcC_sps is called inside inflate_sample_table_video.
     if method == 'inflate':
         if log_func:
             log_func("")
-            log_func("── 8/8  Frame Count Inflation (5x) ─────────────────────────────────")
-        inflated = inflate_sample_table_video(data, multiplier=5, keep_tables=True)
+            log_func("── 9/9  Frame Count Inflation (5x, filler NALs) ─────────────────────────")
+        inflated = inflate_sample_table_video(data, multiplier=5)
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
@@ -1031,7 +1117,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
     elif method == 'balanced-sync':
         if log_func:
             log_func("")
-            log_func("── 8/8  Balanced Sync (Timescale Division + Playback Speed elst) ────────────")
+            log_func("── 9/9  Balanced Sync (Timescale Division + Playback Speed elst) ────────────")
         data = patch_timescale_multiplier(data, multiplier=2)
         data = add_balanced_sync_elst(data, multiplier=2)
         if log_func:
