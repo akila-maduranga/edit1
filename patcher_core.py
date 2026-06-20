@@ -974,159 +974,66 @@ def add_balanced_sync_elst(data, multiplier=2):
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
 def patch_all(input_path, output_path, comment=None, log_func=None, method='balanced-sync', use_inflation=None):
-    """9-pass pipeline. Inflation runs last (Pass 9) so all other modifications
-    (elst bypass, fingerprinting, codec spoofing, comment, audio restore) are applied first."""
     if use_inflation is not None:
-        if use_inflation:
-            method = 'inflate'
-        else:
-            method = 'codec-spoof'
+        method = 'inflate' if use_inflation else 'codec-spoof'
 
     if log_func:
         log_func(f"[JOB] starting pipeline (method: {method})")
 
     input_path = Path(input_path)
     output_path = Path(output_path)
-    stem = input_path.stem
-    suffix = input_path.suffix
 
-    # Normalize — always inject '@akila' as comment unless user provides a custom one
-    if comment is None or comment == "@akila":
-        final_comment = "@akila"
-    else:
-        final_comment = comment
-
+    # Read original data
     original_data = input_path.read_bytes()
-
     valid, msg = validate_mp4(original_data)
     if not valid:
-        if log_func:
-            log_func(f"[ERROR] MP4 validation failed: {msg}")
+        if log_func: log_func(f"[ERROR] MP4 validation failed: {msg}")
         return False
-    if log_func:
-        log_func(f"[VALIDATE] MP4 structure: {msg}")
+    if log_func: log_func(f"[VALIDATE] MP4 structure: {msg}")
 
     original_audio_dur = read_audio_duration(original_data)
     if log_func and original_audio_dur is not None:
         log_func(f"[AUDIO] original duration={original_audio_dur}")
 
-    # ── Pass 1: Move moov to front (pure Python, preserves all metadata) ──
-    if log_func:
-        log_func("")
-        log_func("── 1/9  Python reloov (moov to front) ─────────────────────")
-    data = bytearray(original_data)
-    ftyp_off, ftyp_sz = _find_box(data, b"ftyp")
-    moov_off, moov_sz = _find_box(data, b"moov")
-    mdat_off, mdat_sz = _find_box(data, b"mdat")
-    if ftyp_off == -1 or moov_off == -1 or mdat_off == -1:
-        if log_func:
-            log_func("[ERROR] missing ftyp, moov, or mdat")
-        return False
-    # Build: ftyp + moov + all other boxes (free, etc.) in original order
-    rest = bytearray()
-    pos = 0
-    while pos + 8 <= len(data):
-        sz = int.from_bytes(data[pos:pos+4], 'big')
-        hdr = 8
-        if sz == 1:
-            if pos + 16 > len(data):
-                break
-            sz = int.from_bytes(data[pos+8:pos+16], 'big')
-            hdr = 16
-        elif sz == 0:
-            sz = len(data) - pos
-        if sz < hdr:
-            break
-        btype = data[pos+4:pos+8]
-        if btype not in (b'ftyp', b'moov'):
-            rest.extend(data[pos:pos+sz])
-        pos += sz
-    new_ftyp = data[ftyp_off:ftyp_off+ftyp_sz]
-    new_moov = data[moov_off:moov_off+moov_sz]
-    result = bytearray(new_ftyp + new_moov + rest)
-    # Adjust stco entries by moov position delta
-    orig_mdat_data = mdat_off + 8
-    new_mdat_data = ftyp_sz + moov_sz + 8  # after ftyp, moov, and free's 8-byte header
-    # Actually mdat is the next box in 'rest', so new_mdat_data = ftyp_sz + moov_sz + (rest starts)
-    # rest starts at ftyp_sz + moov_sz, and the first box in rest is the free box (8 bytes) or mdat itself
-    # Let's recalculate: mdat data starts at ftyp_sz + moov_sz + (mdat offset within rest)
-    # Simpler: find mdat position in result
-    new_mdat_off = result.find(b'mdat') - 4
-    new_mdat_data = new_mdat_off + 8
-    delta = new_mdat_data - orig_mdat_data
-    _adjust_stco(result, delta, ftyp_sz + 8, ftyp_sz + 8 + moov_sz)
-    data = bytes(result)
-    if log_func:
-        log_func(f"[RELOOV] {len(data):,} bytes, stco delta={delta}")
-        _dump_atoms(data, "RELOOV", log_func)
+    data = original_data
 
-
-
-    # ── Pass 2: mvhd Fingerprint ────────────────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 2/9  mvhd Fingerprint (next_track_id=9999, fixed date) ──")
-    data = patch_mvhd_fingerprint(data)
-    if log_func:
-        log_func("[MVHD] done")
-
-    # ── Pass 3: Udta Strip (remove ffmpeg encoder tag) ──────────────────
-    if log_func:
-        log_func("")
-        log_func("── 3/9  Udta Strip ─────────────────────────────────────────")
+    # Always strip udta (remove encoder tags)
+    if log_func: log_func("")
+    if log_func: log_func("── Udta Strip ─────────────────────────────────────────")
     data = strip_udta(data)
-    if log_func:
-        log_func("[UDTA] done")
+    if log_func: log_func("[UDTA] done")
 
-    # ── Pass 4: tkhd Fingerprint ────────────────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 4/9  tkhd Fingerprint (alternate_group) ────────────────")
-    data = fingerprint_tkhd(data)
-    if log_func:
-        log_func("[TKHD] done")
-
-    # ── Pass 5: Codec Spoofing (avc1→avc3, M4VH brand) ─────────────────
-    if log_func:
-        log_func("")
-        log_func("── 5/9  Codec Spoofing ────────────────────────────────────")
-    data = patch_stsd_codec(data)
-    data = patch_ftyp(data)
-    if log_func:
-        log_func("[CODEC] done")
-
-    # ── Pass 6: Restore original audio duration ─────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 6/9  Audio Duration Restore ────────────────────────────")
+    # Restore audio duration to original
+    if log_func: log_func("")
+    if log_func: log_func("── Audio Duration Restore ────────────────────────────")
     data = patch_audio_duration(data, original_audio_dur)
-    if log_func:
-        log_func("[AUDIO] done")
+    if log_func: log_func("[AUDIO] done")
 
-    # ── Pass 7: Frame Count Inflation (10x, filler NALs) ───────────────
-    # Inflation runs after audio fix. _patch_avcC_sps is called inside.
+    # Only apply inflation if method == 'inflate'
     if method == 'inflate':
-        if log_func:
-            log_func("")
-            log_func("── 7/9  Frame Count Inflation (10x, filler NALs) ────────────────────────")
+        if log_func: log_func("")
+        if log_func: log_func("── Frame Count Inflation (10x, clean duplication) ───────────────")
         inflated = inflate_sample_table_video(data, multiplier=10)
         if inflated is None:
-            if log_func:
-                log_func("[ERROR] Frame inflation failed")
+            if log_func: log_func("[ERROR] Frame inflation failed")
             return False
         data = inflated
-        if log_func:
-            log_func("[INFLATE] done")
+        if log_func: log_func("[INFLATE] done")
 
-    # ── Pass 8: Move moov to end ────────────────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 8/9  reloov_end (moov to end) ─────────────────────────")
+    # Optionally inject comment (if provided)
+    if comment:
+        if log_func: log_func("")
+        if log_func: log_func("── Comment Injection ─────────────────────────────")
+        data = inject_comment_udta(data, comment)
+        if log_func: log_func("[COMMENT] injected")
+
+    # Move moov to the end (non-faststart)
+    if log_func: log_func("")
+    if log_func: log_func("── reloov_end (moov to end) ─────────────────────────")
     data = reloov_end(data)
-    if log_func:
-        log_func("[RELOOV_END] done")
+    if log_func: log_func("[RELOOV_END] done")
 
-    # Final verify
+    # Final verification
     if log_func:
         log_func("")
         log_func("── Atom layout ───────────────────────────────────────────────")
@@ -1137,11 +1044,8 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
         log_func(f"[VERIFY] file size: {len(data):,} bytes")
 
     output_path.write_bytes(data)
-    if log_func:
-        log_func(f"[WRITE] {output_path.name}  ({len(data):,} bytes)")
-
-    if log_func:
-        log_func(f"[DONE]  {output_path.name}")
+    if log_func: log_func(f"[WRITE] {output_path.name}  ({len(data):,} bytes)")
+    if log_func: log_func(f"[DONE]  {output_path.name}")
     return True
 
 
