@@ -67,7 +67,7 @@ def parse_boxes(data, start=0, end=None):
     return boxes
 
 # ==========================================
-# Table Inflators (Fix 1)
+# Table Inflators
 # ==========================================
 def inflate_stts(box, loop_count):
     data = box.data
@@ -341,7 +341,7 @@ def inflate_sample_table_video(data, loop_count=10):
     return bytes(new_data)
 
 # ==========================================
-# Offset Adjuster & reloov_end (Fix 2)
+# Offset Adjuster & reloov_end
 # ==========================================
 def _find_box(data, box_type, start=0, end=None):
     if end is None:
@@ -408,6 +408,7 @@ def _adjust_stco(data, delta, start, end):
         pos += size
 
 def reloov_end(data):
+    """Moves moov to end. NOTE: For TikTok, it is usually better to keep moov at the beginning (faststart)."""
     ftyp_off, ftyp_sz = _find_box(data, b'ftyp')
     moov_off, moov_sz = _find_box(data, b'moov')
     if -1 in (ftyp_off, moov_off) or ftyp_off != 0:
@@ -449,21 +450,23 @@ def reloov_end(data):
 # Main Entry Points (File I/O Wrappers)
 # ==========================================
 def tikquick_encode(input_path, output_path, log_func=None, **kwargs):
-    """Re-encodes the video to TikQuick quality using ffmpeg."""
+    """Re-encodes the video to strict TikTok-preferred specs to prevent server compression."""
     try:
         if not shutil.which("ffmpeg"):
             if log_func: log_func("[ERROR] ffmpeg not found in PATH.")
             return False
             
-        if log_func: log_func("[ENCODE] Starting TikQuick quality encode...")
+        if log_func: log_func("[ENCODE] Starting TikQuick quality encode (1080x1920, 30fps, H.264)...")
         
-        # TikQuick standard settings: 1080p, H.264, AAC, faststart
+        # Strict TikTok specs: 1080 width, max 6Mbps bitrate, 30fps, yuv420p, faststart (moov at beginning)
         cmd = [
             "ffmpeg", "-y", "-i", str(input_path),
-            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-            "-vf", "scale='min(1080,iw)':-2",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
+            "-c:v", "libx264", "-profile:v", "high", "-level", "4.0",
+            "-preset", "medium", "-crf", "23",
+            "-maxrate", "6M", "-bufsize", "12M",
+            "-vf", "scale='if(gt(iw,ih),1080,-2)':'if(gt(iw,ih),-2,1920)',fps=30,format=yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
+            "-movflags", "+faststart",  # Puts moov at the BEGINNING (Crucial for TikTok)
             str(output_path)
         ]
         
@@ -490,11 +493,12 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='infl
             if log_func: log_func("[PATCH] Inflating sample tables 10x...")
             data = inflate_sample_table_video(data, loop_count=10)
             
-        if log_func: log_func("[PATCH] Relocating moov to end and fixing offsets...")
-        data = reloov_end(data)
+        # For TikTok, moov should ideally be at the beginning (handled by ffmpeg +faststart during encode).
+        # If you still want to force moov to the end, uncomment the next 2 lines:
+        # if log_func: log_func("[PATCH] Relocating moov to end and fixing offsets...")
+        # data = reloov_end(data)
         
         if comment:
-            # Placeholder for comment injection logic if needed later
             if log_func: log_func(f"[PATCH] Comment received but injection is skipped in this build.")
             
         with open(output_path, 'wb') as f:
