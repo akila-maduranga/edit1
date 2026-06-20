@@ -33,6 +33,13 @@ def _box_content_off(data, box_off):
     return box_off + _box_hdr_sz(data, box_off)
 
 
+def _read_box_size(data, box_off):
+    """Read the actual size of a box, handling both 32-bit and 64-bit headers."""
+    if _box_hdr_sz(data, box_off) == 16:
+        return int.from_bytes(data[box_off+8:box_off+16], 'big')
+    return int.from_bytes(data[box_off:box_off+4], 'big')
+
+
 def _hdlr_type_off(data, hdlr_off):
     """Return offset of the handler_type field inside an hdlr box.
     hdlr is a FullBox: version+flags (4) + pre_defined (4) + handler_type (4).
@@ -249,7 +256,7 @@ def strip_udta(data):
     # Only adjust stco if moov is before mdat (mdat moves when moov changes)
     mdat_off, _ = _find_box(data, b"mdat")
     if moov_off < mdat_off:
-        _adjust_stco(data, -udta_sz, _box_content_off(data, moov_off), moov_off+8+new_moov_sz)
+        _adjust_stco(data, -udta_sz, _box_content_off(data, moov_off), moov_off+new_moov_sz)
     return bytes(data)
 
 
@@ -405,12 +412,17 @@ def rebuild_elst_bypass(data):
             this_delta += len(modifications[j][2]) - modifications[j][1]
             j += 1
         effective_off = trak_off + cum_delta
-        _update_box_size(new_data, effective_off, int.from_bytes(new_data[effective_off:effective_off+4], 'big') + this_delta)
+        cur_sz = int.from_bytes(new_data[effective_off:effective_off+4], 'big')
+        if _box_hdr_sz(new_data, effective_off) == 16:
+            cur_sz = int.from_bytes(new_data[effective_off+8:effective_off+16], 'big')
+        _update_box_size(new_data, effective_off, cur_sz + this_delta)
         cum_delta += this_delta
         i = j
     moov_read = int.from_bytes(new_data[moov_off:moov_off+4], 'big')
+    if _box_hdr_sz(new_data, moov_off) == 16:
+        moov_read = int.from_bytes(new_data[moov_off+8:moov_off+16], 'big')
     _update_box_size(new_data, moov_off, moov_read + total_delta)
-    _adjust_stco(new_data, total_delta, _box_content_off(new_data, moov_off), moov_off+8+moov_sz+total_delta)
+    _adjust_stco(new_data, total_delta, _box_content_off(new_data, moov_off), moov_off+moov_sz+total_delta)
     return bytes(new_data)
 
 
@@ -436,9 +448,9 @@ def _patch_avcC_sps(data):
         stsd_off, _ = _find_box(data, b"stsd", _box_content_off(data, stbl_off), stbl_off+stbl_sz)
         if stsd_off == -1:
             continue
-        stsd_end = stsd_off + int.from_bytes(data[stsd_off:stsd_off+4], 'big')
-        entry_count = int.from_bytes(data[stsd_off+8:stsd_off+12], 'big')
-        pos = stsd_off + 12
+        stsd_end = stsd_off + _read_box_size(data, stsd_off)
+        entry_count = int.from_bytes(data[stsd_off+_box_hdr_sz(data, stsd_off)+4:stsd_off+_box_hdr_sz(data, stsd_off)+8], 'big')
+        pos = stsd_off + _box_hdr_sz(data, stsd_off) + 8
         for _ in range(entry_count):
             if pos + 8 > stsd_end:
                 break
@@ -573,9 +585,7 @@ def inflate_sample_table_video(data, multiplier=10):
 
     # Update container sizes (handles both 32-bit and 64-bit box headers)
     for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
-        cur = int.from_bytes(result[container_off:container_off+4], 'big')
-        if cur == 1:
-            cur = int.from_bytes(result[container_off+8:container_off+16], 'big')
+        cur = _read_box_size(result, container_off)
         _update_box_size(result, container_off, cur + moov_delta)
 
     # Adjust stco offsets for moov growth ONLY when moov is before mdat.
@@ -645,7 +655,7 @@ def inject_comment_udta(data, comment):
     _update_box_size(result, moov_off, new_moov_sz)
     mdat_off, _ = _find_box(result, b"mdat")
     if moov_off < mdat_off:
-        _adjust_stco(result, delta, _box_content_off(result, moov_off), moov_off+8+new_moov_sz)
+        _adjust_stco(result, delta, _box_content_off(result, moov_off), moov_off+new_moov_sz)
 
     return bytes(result)
 
@@ -940,11 +950,9 @@ def add_balanced_sync_elst(data, multiplier=2):
 
         # Update container sizes
         _update_box_size(p, trak_off, trak_sz + delta)
-        old_moov_read = int.from_bytes(p[moov_off:moov_off+4], 'big')
-        if old_moov_read == 1:
-            old_moov_read = int.from_bytes(p[moov_off+8:moov_off+16], 'big')
+        old_moov_read = _read_box_size(p, moov_off)
         _update_box_size(p, moov_off, old_moov_read + delta)
-        _adjust_stco(p, delta, _box_content_off(p, moov_off), moov_off+8+old_moov_read+delta)
+        _adjust_stco(p, delta, _box_content_off(p, moov_off), moov_off+old_moov_read+delta)
         moov_end = moov_off + old_moov_read + delta
 
     return bytes(p)
