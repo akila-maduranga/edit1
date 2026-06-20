@@ -1105,8 +1105,8 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
     if method == 'inflate':
         if log_func:
             log_func("")
-            log_func("── 9/9  Frame Count Inflation (5x, filler NALs) ─────────────────────────")
-        inflated = inflate_sample_table_video(data, multiplier=5)
+            log_func("── 9/9  Frame Count Inflation (4x, filler NALs) ─────────────────────────")
+        inflated = inflate_sample_table_video(data, multiplier=4)
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
@@ -1145,6 +1145,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
 TIKQUICK_ENCODE_ARGS = [
     "-vf", "fps=10000,scale=1920:1080,setdar=9/16,setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
     "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+    "-b:v", "40M",
     "-maxrate", "40M", "-bufsize", "40M",
     "-pix_fmt", "yuv420p",
     "-profile:v", "high", "-level", "4.2",
