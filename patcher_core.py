@@ -451,3 +451,20 @@ def reloov_end(data):
         _adjust_stco(new_data, mdat_delta, new_moov_off, new_moov_off + moov_sz)
         
     return bytes(new_data)
+
+# ==========================================
+# Main Entry Point
+# ==========================================
+def patch_all(data, loop_count=10):
+    """
+    Main function to apply all patches.
+    1. Inflates sample tables (stts, stsz, stsc, stco, ctts, stss)
+    2. Relocates moov to the end and fixes stco offsets
+    """
+    # Step 1: Inflate sample tables
+    data = inflate_sample_table_video(data, loop_count)
+    
+    # Step 2: Relocate moov to the end and adjust offsets
+    data = reloov_end(data)
+    
+    return data
