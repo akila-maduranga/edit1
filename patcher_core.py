@@ -78,7 +78,9 @@ def reloov_end(data):
     moov_off, moov_sz = _find_box(data, b'moov')
     if -1 in (ftyp_off, moov_off) or ftyp_off != 0:
         return data
+    # Track where each non-ftyp/non-moov box lands in the new layout
     rest = bytearray()
+    box_positions = {}  # btype -> new offset in result (relative to ftyp end)
     pos = 0
     while pos + 8 <= len(data):
         sz = int.from_bytes(data[pos:pos+4], 'big')
@@ -92,11 +94,13 @@ def reloov_end(data):
         if sz < hdr: break
         btype = data[pos+4:pos+8]
         if btype not in (b'ftyp', b'moov'):
+            box_positions[btype] = ftyp_sz + len(rest)
             rest.extend(data[pos:pos+sz])
         pos += sz
     new_moov_off = ftyp_sz + len(rest)
+    # Find mdat's NEW offset in the result layout (not hardcoded to ftyp_sz)
     old_mdat_off, _ = _find_box(data, b'mdat')
-    new_mdat_off = ftyp_sz
+    new_mdat_off = box_positions.get(b'mdat', ftyp_sz)
     mdat_delta = new_mdat_off - old_mdat_off
     result = bytearray()
     result.extend(data[ftyp_off:ftyp_off+ftyp_sz])
@@ -572,9 +576,13 @@ def inflate_sample_table_video(data, multiplier=10):
         old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
         struct.pack_into('>I', result, container_off, old_sz + moov_delta)
 
-    # Adjust stco offsets for moov growth (mdat shifts right)
+    # Adjust stco offsets for moov growth ONLY when moov is before mdat.
+    # When moov is after mdat (phone recordings), mdat doesn't move when moov
+    # grows, so stco offsets must stay unchanged.
     new_moov_end = moov_off + moov_sz + moov_delta
-    _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
+    mdat_off, _ = _find_box(bytes(result), b'mdat')
+    if moov_off < mdat_off:
+        _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
     # Update durations to match inflated timeline
     total_ticks = total_count * new_delta
@@ -591,7 +599,17 @@ def inflate_sample_table_video(data, multiplier=10):
             mvhd_dur = int(total_sec * mvhd_ts)
             result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
 
+    # Only update VIDEO track durations (skip audio tracks so the audio
+    # duration restore (step 7) is not undone here).
     for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
+        # Skip non-video tracks
+        _mdia_off2, _mdia_sz2 = _find_box(result, b'mdia', trak_off+8, trak_off+trak_sz)
+        if _mdia_off2 != -1:
+            _hdlr_off2, _ = _find_box(result, b'hdlr', _mdia_off2+8, _mdia_off2+_mdia_sz2)
+            if _hdlr_off2 != -1 and _hdlr_off2 + 20 <= len(result):
+                if result[_hdlr_off2+16:_hdlr_off2+20] != b'vide':
+                    continue
+
         tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
         if tkhd_off != -1:
             ver = result[tkhd_off+8]
@@ -1003,12 +1021,6 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
     data = strip_udta(data)
     if log_func: log_func("[UDTA] done")
 
-    # Restore audio duration to original
-    if log_func: log_func("")
-    if log_func: log_func("── Audio Duration Restore ────────────────────────────")
-    data = patch_audio_duration(data, original_audio_dur)
-    if log_func: log_func("[AUDIO] done")
-
     # Only apply inflation if method == 'inflate'
     if method == 'inflate':
         if log_func: log_func("")
@@ -1019,6 +1031,13 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
             return False
         data = inflated
         if log_func: log_func("[INFLATE] done")
+
+    # Restore audio duration to original (AFTER inflation so it isn't overwritten)
+    if original_audio_dur is not None:
+        if log_func: log_func("")
+        if log_func: log_func("── Audio Duration Restore ────────────────────────────")
+        data = patch_audio_duration(data, original_audio_dur)
+        if log_func: log_func("[AUDIO] done")
 
     # Optionally inject comment (if provided)
     if comment:
