@@ -366,6 +366,13 @@ def inflate_sample_table_video(data, loop_count=5):
     new_data.extend(new_moov_data)
     new_data.extend(data[moov_off+moov_sz:])
     
+    # Fix stco/co64 offsets for the moov growth
+    old_moov_sz = moov_sz
+    new_moov_sz = len(new_moov_data)
+    moov_delta = new_moov_sz - old_moov_sz
+    if moov_delta != 0:
+        _adjust_stco(new_data, moov_delta, moov_off + 8, moov_off + new_moov_sz)
+    
     return bytes(new_data)
 
 # ==========================================
