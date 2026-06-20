@@ -72,6 +72,50 @@ def _adjust_stco(data, delta, search_start=0, search_end=None):
                 stack.append((off + 8, off + sz))
 
 
+def reloov_end(data):
+    """Move moov to end of file. Inverse of reloov (moov to front)."""
+    ftyp_off, ftyp_sz = _find_box(data, b'ftyp')
+    moov_off, moov_sz = _find_box(data, b'moov')
+    if -1 in (ftyp_off, moov_off) or ftyp_off != 0:
+        return data
+    rest = bytearray()
+    pos = 0
+    while pos + 8 <= len(data):
+        sz = int.from_bytes(data[pos:pos+4], 'big')
+        hdr = 8
+        if sz == 1:
+            if pos + 16 > len(data): break
+            sz = int.from_bytes(data[pos+8:pos+16], 'big')
+            hdr = 16
+        elif sz == 0:
+            break
+        if sz < hdr: break
+        btype = data[pos+4:pos+8]
+        if btype not in (b'ftyp', b'moov'):
+            rest.extend(data[pos:pos+sz])
+        pos += sz
+    new_moov_off = ftyp_sz + len(rest)
+    old_mdat_off, _ = _find_box(data, b'mdat')
+    new_mdat_off = ftyp_sz
+    mdat_delta = new_mdat_off - old_mdat_off
+    result = bytearray()
+    result.extend(data[ftyp_off:ftyp_off+ftyp_sz])
+    result.extend(rest)
+    result.extend(data[moov_off:moov_off+moov_sz])
+    _adjust_stco(result, mdat_delta, new_moov_off+8, new_moov_off+8+moov_sz)
+    # Debug: check if moov can be found
+    test_moov = _find_box(result, b'moov')
+    if test_moov == -1:
+        import sys as _sys
+        _sys.stderr.write(f"[RELOOV_END] moov NOT FOUND after _adjust_stco!\n")
+        # Try to find what's at moov position
+        _sys.stderr.write(f"[RELOOV_END] moov header: {result[new_moov_off:new_moov_off+8].hex()}\n")
+        _sys.stderr.write(f"[RELOOV_END] structure around moov:\n")
+        for off in range(max(0, new_moov_off-20), min(len(result), new_moov_off+40), 4):
+            _sys.stderr.write(f"  [{off}] {result[off:off+4].hex()} '{result[off:off+4].decode('latin-1', errors='replace')}'\n")
+    return bytes(result)
+
+
 def validate_mp4(data):
     """Validate basic MP4 structure: ftyp at start, moov and mdat present, boxes well-formed."""
     if len(data) < 12:
@@ -502,14 +546,12 @@ def inflate_sample_table_video(data, multiplier=5):
     new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
 
     # Non-interleaved stco: all real offsets, then all filler offsets
+    moov_before_mdat = moov_off < mdat_off
     new_stco_count = total_count
     new_stco_body2 = bytearray(8 + new_stco_count * 4)
     struct.pack_into('>II', new_stco_body2, 0, 0, new_stco_count)
     for i in range(real_count):
         struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
-    for i in range(fake_count):
-        pos = mdat_off + mdat_sz + i * FILLER_NAL_SIZE
-        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
     new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
 
     replacements = [
@@ -525,6 +567,16 @@ def inflate_sample_table_video(data, multiplier=5):
     stsc_delta = len(new_stsc) - stsc_sz
     stco_delta = len(new_stco2) - stco_sz
     moov_delta = stts_delta + stsz_delta + stsc_delta + stco_delta
+
+    # Fill in fake frame offsets (need moov_delta first for base computation)
+    fake_frame_base = mdat_off + mdat_sz
+    if moov_before_mdat:
+        fake_frame_base += moov_delta
+    for i in range(fake_count):
+        pos = fake_frame_base + i * FILLER_NAL_SIZE
+        struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, pos)
+    new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
+
     new_size = len(data) + moov_delta
     result = bytearray(new_size)
 
@@ -542,17 +594,28 @@ def inflate_sample_table_video(data, multiplier=5):
         old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
         struct.pack_into('>I', result, container_off, old_sz + moov_delta)
 
-    new_moov_end = moov_off + moov_sz + moov_delta
-    _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
-
-    # Extend mdat with filler NALs and update mdat header
-    result.extend(filler_data)
-    struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + len(filler_data))
+    if moov_before_mdat:
+        new_moov_end = moov_off + moov_sz + moov_delta
+        _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
+        result.extend(filler_data)
+        struct.pack_into('>I', result, mdat_off + moov_delta, mdat_sz + len(filler_data))
+        stbl_search_end = new_moov_end
+        shifted_moov_off = moov_off
+    else:
+        stbl_search_end = moov_off + moov_sz + moov_delta + len(filler_data)
+        shifted_moov_off = moov_off + len(filler_data)
+        insert_at = mdat_off + mdat_sz
+        new_result = bytearray(len(result) + len(filler_data))
+        new_result[:insert_at] = result[:insert_at]
+        new_result[insert_at:insert_at + len(filler_data)] = filler_data
+        new_result[insert_at + len(filler_data):] = result[insert_at:]
+        result = new_result
+        struct.pack_into('>I', result, mdat_off, mdat_sz + len(filler_data))
 
     # Container durations match total stts (prevents freeze)
     total_stts_dur = (real_count * last_delta) + (fake_count * fake_delta)
     total_sec = total_stts_dur / 90000.0
-    mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, new_moov_end)
+    mvhd_off, _ = _find_box(result, b"mvhd", shifted_moov_off+8, stbl_search_end)
     if mvhd_off != -1:
         ver = result[mvhd_off+8]
         if ver == 0:
@@ -565,7 +628,7 @@ def inflate_sample_table_video(data, multiplier=5):
             result[mvhd_off+36:mvhd_off+44] = struct.pack('>Q', mvhd_dur)
 
     trak_dur = mvhd_dur
-    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, new_moov_end):
+    for trak_off, trak_sz, _ in _iter_boxes(result, shifted_moov_off+8, stbl_search_end):
         tkhd_off, _ = _find_box(result, b"tkhd", trak_off+8, trak_off+trak_sz)
         if tkhd_off != -1:
             ver = result[tkhd_off+8]
@@ -1043,70 +1106,54 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
 
 
 
-    # ── Pass 2: ZeroLoss Track Bypass (edts/elst rebuild) ─────────────
+    # ── Pass 2: mvhd Fingerprint ────────────────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 2/9  ZeroLoss Track Bypass (edts/elst) ─────────────────")
-    data = rebuild_elst_bypass(data)
-    if log_func:
-        log_func("[ELST] done")
-
-    # ── Pass 3: mvhd Fingerprint ────────────────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 3/9  mvhd Fingerprint (next_track_id=9999, fixed date) ──")
+        log_func("── 2/9  mvhd Fingerprint (next_track_id=9999, fixed date) ──")
     data = patch_mvhd_fingerprint(data)
     if log_func:
         log_func("[MVHD] done")
 
-    # ── Pass 4: Udta Strip (remove ffmpeg encoder tag) ──────────────────
+    # ── Pass 3: Udta Strip (remove ffmpeg encoder tag) ──────────────────
     if log_func:
         log_func("")
-        log_func("── 4/9  Udta Strip ─────────────────────────────────────────")
+        log_func("── 3/9  Udta Strip ─────────────────────────────────────────")
     data = strip_udta(data)
     if log_func:
         log_func("[UDTA] done")
 
-    # ── Pass 5: tkhd Fingerprint ────────────────────────────────────────
+    # ── Pass 4: tkhd Fingerprint ────────────────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 5/9  tkhd Fingerprint (alternate_group) ────────────────")
+        log_func("── 4/9  tkhd Fingerprint (alternate_group) ────────────────")
     data = fingerprint_tkhd(data)
     if log_func:
         log_func("[TKHD] done")
 
-    # ── Pass 6: Codec Spoofing (for all methods) ─────────────────────────
+    # ── Pass 5: Codec Spoofing (avc1→avc3, M4VH brand) ─────────────────
     if log_func:
         log_func("")
-        log_func("── 6/9  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
+        log_func("── 5/9  Codec Spoofing ────────────────────────────────────")
     data = patch_stsd_codec(data)
     data = patch_ftyp(data)
     if log_func:
         log_func("[CODEC] done")
 
-    # ── Pass 7: Comment Udta Injection ──────────────────────────────────
+    # ── Pass 6: Restore original audio duration ─────────────────────────
     if log_func:
         log_func("")
-        log_func("── 7/9  Comment Udta Injection ────────────────────────────")
-    data = inject_comment_udta(data, final_comment)
-    if log_func:
-        log_func(f"[COMMENT] injected ({final_comment!r})")
-
-    # ── Pass 8: Restore original audio duration ─────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 8/9  Audio Duration Restore ────────────────────────────")
+        log_func("── 6/9  Audio Duration Restore ────────────────────────────")
     data = patch_audio_duration(data, original_audio_dur)
     if log_func:
         log_func("[AUDIO] done")
 
-    # ── Pass 9: Bypass Method (Inflation / Balanced Sync) ───────────────
-    # Inflation runs LAST. _patch_avcC_sps is called inside inflate_sample_table_video.
+    # ── Pass 7: Frame Count Inflation (10x, filler NALs) ───────────────
+    # Inflation runs after audio fix. _patch_avcC_sps is called inside.
     if method == 'inflate':
         if log_func:
             log_func("")
-            log_func("── 9/9  Frame Count Inflation (5x, filler NALs) ─────────────────────────")
-        inflated = inflate_sample_table_video(data, multiplier=5)
+            log_func("── 7/9  Frame Count Inflation (10x, filler NALs) ────────────────────────")
+        inflated = inflate_sample_table_video(data, multiplier=10)
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
@@ -1114,14 +1161,14 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
         data = inflated
         if log_func:
             log_func("[INFLATE] done")
-    elif method == 'balanced-sync':
-        if log_func:
-            log_func("")
-            log_func("── 9/9  Balanced Sync (Timescale Division + Playback Speed elst) ────────────")
-        data = patch_timescale_multiplier(data, multiplier=2)
-        data = add_balanced_sync_elst(data, multiplier=2)
-        if log_func:
-            log_func("[BALANCED-SYNC] done")
+
+    # ── Pass 8: Move moov to end ────────────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 8/9  reloov_end (moov to end) ─────────────────────────")
+    data = reloov_end(data)
+    if log_func:
+        log_func("[RELOOV_END] done")
 
     # Final verify
     if log_func:
@@ -1143,17 +1190,17 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
 
 
 TIKQUICK_ENCODE_ARGS = [
-    "-vf", "fps=10000,scale=1920:1080,setdar=9/16,setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
+    "-vf", "fps=60,scale=1080:1920,setsar=1/1,setdar=9/16,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709",
     "-c:v", "libx264", "-preset", "slow", "-crf", "18",
     "-b:v", "40M",
     "-maxrate", "40M", "-bufsize", "40M",
     "-pix_fmt", "yuv420p",
     "-profile:v", "high", "-level", "4.2",
+    "-bf", "0",
     "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
     "-metadata", 'encoder=TikQuick Quality Method - https://tikquick.online/',
     "-metadata:s:v:0", 'encoder=TikQuick Quality Method - https://tikquick.online/',
     "-metadata:s:a:0", 'encoder=TikQuick Quality Method - https://tikquick.online/',
-    "-movflags", "+faststart",
 ]
 
 

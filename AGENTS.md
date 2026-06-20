@@ -1,10 +1,9 @@
-## Goal
-- ~~Bypass TikTok re-encode detection via stsz frame count inflation while keeping video fully decodable (no H.264/AAC errors, correct duration).~~
-- **REVISED**: Prevent TikTok duration-doubling bug and ensure correct processing of stsz-inflated files. TikTok re-encodes ALL uploads regardless.
+## Goal  
+Prevent TikTok duration-doubling bug and ensure correct processing of stsz-inflated files.
 
 ## Constraints & Preferences
 - Must work on real TikTok uploads, not just ffmpeg decode.
-- Original file is `E:\Movies\Video 202sasgwrg6.mp4` (moov‑after‑mdat layout).
+- Original test file: `E:\Movies\video_20260619_163846.mp4` (148MB, 64-bit box sizes, `co64` chunk offsets).
 - Only low‑level bitstream editing (no full remux on device).
 
 ## Key Discovery
@@ -32,26 +31,25 @@
 - Fixed stsc simplification bug (original alternates spc 1/2; can't simplify to all spc=1).
 - Fixed fake frame delta (was `1` tick, now uses `avg_delta` = ~1500 ticks so total duration matches inflated frame count).
 - Fixed audio duration mismatch (inflated audio mdhd to match video multiplier).
+- Fixed version reads in `inflate_sample_table_video`: `+12`→`+8` for mvhd/tkhd/mdhd duration — was reading creation_time MSB as version, overwriting hdlr type.
+- Fixed `reloov_end` moov detection: when `sz==0` (filler tail of zeros), `break` instead of `sz = len(data)-pos` — was swallowing moov into zeroed box.
 
 ### In Progress
-- Understanding that TikTok always re-encodes and stsz inflation is only for duration correction.
+- (none)
 
 ### Blocked
 - No way to prevent TikTok re-encoding entirely (server-side policy).
 
 ## Current Best Approach
-**Minimal approach** (in `inflate_stsz_only`):
-1. Inflate only stsz entry count (append zero-size entries)
-2. Inflate only stts entry count (append entries with avg_delta)
-3. Set mvhd/tkhd/mdhd durations to match new stsz count
-4. Keep original stco/stsc UNCHANGED
-5. File plays locally (948 real frames, decoder ignores extra stsz entries)
-6. TikTok sees consistent stsz=6323, mvhd=105s ratio, doesn't double duration
-
-**For best results**: also add fingerprinting patches (stsd codec avc1→avc3, ftyp brand, mvhd fingerprint, edit list rebuild).
+**Complete table rebuild** (via `patch_all` with `method='inflate'`):
+1. 8-pass pipeline: reloov → mvhd fingerprint → udta strip → tkhd fingerprint → codec spoofing → audio duration restore → inflation (5x–10x) → reloov_end
+2. Inflation inserts 8-byte filler NALs (`\x00\x00\x00\x01\x0c\x80` + zeros), rebuilds stts/stsz/stsc/stco tables, sets durations to match.
+3. reloov_end moves moov to end of file (TikTok reference layout), adjusts stco entries.
+4. "No fake atoms" policy: no edts/elst bypass, no comment injection — only structural MP4 edits.
 
 ## Relevant Files
-- `C:\Users\Akila\AppData\Local\Temp\opencode\gen_tikquick.py`: `inflate_stsz_only` with current best approach.
-- `E:\New folder (7)\New folder (9)\patcher_core.py`: core patching functions.
-- `E:\Movies\test_tikquick_stsz.mp4`: output file.
-- `E:\Movies\Video 202sasgwrg6.mp4`: original source file.
+- `E:\New folder (7)\New folder (9)\patcher_core.py`: core engine — 8-pass pipeline, `reloov_end()`, `inflate_sample_table_video`, fingerprinting, codec spoofing.
+- `E:\New folder (7)\New folder (9)\test_pipeline.py`: test harness.
+- `E:\Movies\test_final.mp4`: pipeline output.
+- `E:\Movies\video_20260619_163846.mp4`: original source file.
+- `E:\Movies\log.txt`: pipeline execution log.
