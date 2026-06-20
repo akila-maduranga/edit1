@@ -19,6 +19,17 @@ from pathlib import Path
 _SCRIPT_DIR = Path(__file__).parent
 
 
+def _update_box_size(data, box_off, new_size):
+    """Write new_size into a box header, handling 32-bit and 64-bit (extended) sizes."""
+    indicator = int.from_bytes(data[box_off:box_off+4], 'big')
+    if indicator == 1:
+        # 64-bit extended size: actual size is at bytes 8-15
+        struct.pack_into('>Q', data, box_off + 8, new_size)
+    else:
+        # 32-bit size
+        struct.pack_into('>I', data, box_off, new_size)
+
+
 def _iter_boxes(data, start=0, end=None):
     if end is None:
         end = len(data)
@@ -216,7 +227,7 @@ def strip_udta(data):
     data = bytearray(data)
     del data[udta_off:udta_off+udta_sz]
     new_moov_sz = moov_sz - udta_sz
-    struct.pack_into('>I', data, moov_off, new_moov_sz)
+    _update_box_size(data, moov_off, new_moov_sz)
     # Only adjust stco if moov is before mdat (mdat moves when moov changes)
     mdat_off, _ = _find_box(data, b"mdat")
     if moov_off < mdat_off:
@@ -376,12 +387,11 @@ def rebuild_elst_bypass(data):
             this_delta += len(modifications[j][2]) - modifications[j][1]
             j += 1
         effective_off = trak_off + cum_delta
-        orig_sz = int.from_bytes(new_data[effective_off:effective_off+4], 'big')
-        struct.pack_into('>I', new_data, effective_off, orig_sz + this_delta)
+        _update_box_size(new_data, effective_off, int.from_bytes(new_data[effective_off:effective_off+4], 'big') + this_delta)
         cum_delta += this_delta
         i = j
-    moov_sz = int.from_bytes(new_data[moov_off:moov_off+4], 'big')
-    struct.pack_into('>I', new_data, moov_off, moov_sz + total_delta)
+    moov_read = int.from_bytes(new_data[moov_off:moov_off+4], 'big')
+    _update_box_size(new_data, moov_off, moov_read + total_delta)
     _adjust_stco(new_data, total_delta, moov_off+8, moov_off+8+moov_sz+total_delta)
     return bytes(new_data)
 
@@ -575,10 +585,12 @@ def inflate_sample_table_video(data, multiplier=10):
         read_pos = off + old_sz
     result[write_pos:] = data[read_pos:]
 
-    # Update container sizes
+    # Update container sizes (handles both 32-bit and 64-bit box headers)
     for container_off in (stbl_off, minf_off, mdia_off, trak_off, moov_off):
-        old_sz = int.from_bytes(result[container_off:container_off+4], 'big')
-        struct.pack_into('>I', result, container_off, old_sz + moov_delta)
+        cur = int.from_bytes(result[container_off:container_off+4], 'big')
+        if cur == 1:
+            cur = int.from_bytes(result[container_off+8:container_off+16], 'big')
+        _update_box_size(result, container_off, cur + moov_delta)
 
     # Adjust stco offsets for moov growth ONLY when moov is before mdat.
     # When moov is after mdat (phone recordings), mdat doesn't move when moov
@@ -687,7 +699,7 @@ def inject_comment_udta(data, comment):
     result[moov_end+delta:] = data[moov_end:]
 
     new_moov_sz = moov_sz + delta
-    struct.pack_into('>I', result, moov_off, new_moov_sz)
+    _update_box_size(result, moov_off, new_moov_sz)
     mdat_off, _ = _find_box(result, b"mdat")
     if moov_off < mdat_off:
         _adjust_stco(result, delta, moov_off+8, moov_off+8+new_moov_sz)
@@ -984,11 +996,13 @@ def add_balanced_sync_elst(data, multiplier=2):
             p = new_data
 
         # Update container sizes
-        struct.pack_into('>I', p, trak_off, trak_sz + delta)
-        old_moov_sz = int.from_bytes(p[moov_off:moov_off+4], 'big')
-        struct.pack_into('>I', p, moov_off, old_moov_sz + delta)
-        _adjust_stco(p, delta, moov_off+8, moov_off+8+old_moov_sz+delta)
-        moov_end = moov_off + old_moov_sz + delta
+        _update_box_size(p, trak_off, trak_sz + delta)
+        old_moov_read = int.from_bytes(p[moov_off:moov_off+4], 'big')
+        if old_moov_read == 1:
+            old_moov_read = int.from_bytes(p[moov_off+8:moov_off+16], 'big')
+        _update_box_size(p, moov_off, old_moov_read + delta)
+        _adjust_stco(p, delta, moov_off+8, moov_off+8+old_moov_read+delta)
+        moov_end = moov_off + old_moov_read + delta
 
     return bytes(p)
 
