@@ -1,4 +1,6 @@
 import struct
+import subprocess
+import shutil
 from pathlib import Path
 
 # ==========================================
@@ -444,25 +446,63 @@ def reloov_end(data):
     return bytes(new_data)
 
 # ==========================================
-# Main Entry Points
+# Main Entry Points (File I/O Wrappers)
 # ==========================================
-def patch_all(data, loop_count=10, **kwargs):
-    """Applies all patches to raw bytes data. Accepts **kwargs for compatibility."""
-    # Handle PosixPath or string paths being passed instead of bytes
-    if isinstance(data, (str, Path)):
-        with open(data, 'rb') as f:
+def tikquick_encode(input_path, output_path, log_func=None, **kwargs):
+    """Re-encodes the video to TikQuick quality using ffmpeg."""
+    try:
+        if not shutil.which("ffmpeg"):
+            if log_func: log_func("[ERROR] ffmpeg not found in PATH.")
+            return False
+            
+        if log_func: log_func("[ENCODE] Starting TikQuick quality encode...")
+        
+        # TikQuick standard settings: 1080p, H.264, AAC, faststart
+        cmd = [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "-vf", "scale='min(1080,iw)':-2",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(output_path)
+        ]
+        
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        if result.returncode != 0:
+            if log_func: log_func(f"[ERROR] ffmpeg failed:\n{result.stderr[-500:]}")
+            return False
+            
+        if log_func: log_func("[ENCODE] Encoding complete.")
+        return True
+    except Exception as e:
+        if log_func: log_func(f"[ERROR] {e}")
+        return False
+
+def patch_all(input_path, output_path, comment=None, log_func=None, method='inflate', **kwargs):
+    """Reads input file, applies patches, and writes to output path."""
+    try:
+        if log_func: log_func(f"[PATCH] Reading input file: {input_path}")
+        with open(input_path, 'rb') as f:
             data = f.read()
             
-    data = inflate_sample_table_video(data, loop_count)
-    data = reloov_end(data)
-    return data
-
-def tikquick_encode(input_data, loop_count=10, **kwargs):
-    """Wrapper expected by the main script. Accepts file path or bytes."""
-    if isinstance(input_data, (str, Path)):
-        with open(input_data, 'rb') as f:
-            data = f.read()
-    else:
-        data = input_data
+        if method == 'inflate':
+            if log_func: log_func("[PATCH] Inflating sample tables 10x...")
+            data = inflate_sample_table_video(data, loop_count=10)
+            
+        if log_func: log_func("[PATCH] Relocating moov to end and fixing offsets...")
+        data = reloov_end(data)
         
-    return patch_all(data, loop_count)
+        if comment:
+            # Placeholder for comment injection logic if needed later
+            if log_func: log_func(f"[PATCH] Comment received but injection is skipped in this build.")
+            
+        with open(output_path, 'wb') as f:
+            f.write(data)
+            
+        if log_func: log_func(f"[PATCH] Successfully patched to: {output_path}")
+        return True
+        
+    except Exception as e:
+        if log_func: log_func(f"[ERROR] {e}")
+        return False
