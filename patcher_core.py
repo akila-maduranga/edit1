@@ -513,7 +513,11 @@ def inflate_sample_table_video(data, multiplier=10):
 
     # --- Build new tables ---
     total_count = real_count * multiplier
-    new_delta = real_delta * multiplier
+    # Divide delta (not multiply) so total duration stays the same:
+    #   total_count × new_delta = real_count × real_delta
+    # Each real frame is split into `multiplier` shorter samples that
+    # collectively span the same time as the original frame.
+    new_delta = max(real_delta // multiplier, 1)
 
     # stts: single entry
     new_stts_body = struct.pack('>II', 0, 1)      # version_flags=0, entry_count=1
