@@ -1038,7 +1038,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
 
 
 TIKQUICK_ENCODE_ARGS = [
-    "-vf", "fps=60,scale=1920:1080,setdar=9/16,setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
+    "-vf", "fps=400,scale=1920:1080,setdar=9/16,setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
     "-c:v", "libx264", "-preset", "slow", "-crf", "18",
     "-maxrate", "40M", "-bufsize", "40M",
     "-pix_fmt", "yuv420p",
