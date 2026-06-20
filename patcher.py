@@ -32,11 +32,11 @@ if __name__ == "__main__":
     method = "inflate" if args.inflate else args.method
 
     if args.encode:
-        inter = Path(args.input).stem + "_patched_tmp.mp4"
-        ok = patch_all(args.input, inter, comment=args.comment, log_func=log, method=method)
+        inter = Path(args.input).stem + "_encoded_tmp.mp4"
+        ok = tikquick_encode(args.input, inter, log_func=log)
         if not ok:
             sys.exit(1)
-        ok = tikquick_encode(inter, args.output, log_func=log)
+        ok = patch_all(inter, args.output, comment=args.comment, log_func=log, method=method)
         Path(inter).unlink(missing_ok=True)
     else:
         ok = patch_all(args.input, args.output, comment=args.comment, log_func=log, method=method)

@@ -51,31 +51,37 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str, do_encode:
         log.put(f"[JOB]  {job_id[:8]}... started")
         log.put(f"[JOB]  input: {original_name}  ({src.stat().st_size:,} bytes)")
 
-        from patcher_core import patch_all
+        from patcher_core import patch_all, tikquick_encode
 
         def log_func(msg):
             log.put(msg)
 
-        log.put("[STEP] Patching...")
-        success = patch_all(src, inter_path, comment=comment, log_func=log_func, method='inflate')
-
-        if success and do_encode:
-            log.put("[STEP] Re-encoding with TikQuick quality...")
-            from patcher_core import tikquick_encode
-            final_name = f"{stem}_tikquick.mp4"
-            final_path = OUTPUT_DIR / f"{job_id}_{final_name}"
-            encode_ok = tikquick_encode(inter_path, final_path, log_func=log_func)
-            inter_path.unlink(missing_ok=True)
+        if do_encode:
+            log.put("[STEP] Encoding with TikQuick quality...")
+            enc_name = f"{stem}_encoded.mp4"
+            enc_path = OUTPUT_DIR / f"{job_id}_{enc_name}"
+            encode_ok = tikquick_encode(src, enc_path, log_func=log_func)
             if encode_ok:
-                _job_output[job_id] = f"{job_id}_{final_name}"
+                log.put("[STEP] Patching encoded file...")
+                final_name = f"{stem}_tikquick.mp4"
+                final_path = OUTPUT_DIR / f"{job_id}_{final_name}"
+                success = patch_all(enc_path, final_path, comment=comment, log_func=log_func, method='inflate')
+                enc_path.unlink(missing_ok=True)
+                if success:
+                    _job_output[job_id] = f"{job_id}_{final_name}"
+                    _job_status[job_id] = "done"
+                else:
+                    _job_status[job_id] = "error"
+            else:
+                _job_status[job_id] = "error"
+        else:
+            log.put("[STEP] Patching...")
+            success = patch_all(src, inter_path, comment=comment, log_func=log_func, method='inflate')
+            if success:
+                _job_output[job_id] = f"{job_id}_{inter_name}"
                 _job_status[job_id] = "done"
             else:
                 _job_status[job_id] = "error"
-        elif success:
-            _job_output[job_id] = f"{job_id}_{inter_name}"
-            _job_status[job_id] = "done"
-        else:
-            _job_status[job_id] = "error"
 
     except Exception as exc:
         import traceback
