@@ -445,13 +445,13 @@ def reloov_end(data):
 # ==========================================
 # Main Entry Points
 # ==========================================
-def patch_all(data, loop_count=10):
-    """Applies all patches to raw bytes data."""
+def patch_all(data, loop_count=10, **kwargs):
+    """Applies all patches to raw bytes data. Accepts **kwargs for compatibility."""
     data = inflate_sample_table_video(data, loop_count)
     data = reloov_end(data)
     return data
 
-def tikquick_encode(input_data, loop_count=10):
+def tikquick_encode(input_data, loop_count=10, **kwargs):
     """Wrapper expected by the main script. Accepts file path or bytes."""
     if isinstance(input_data, str):
         with open(input_data, 'rb') as f:
