@@ -67,7 +67,7 @@ def parse_boxes(data, start=0, end=None):
     return boxes
 
 # ==========================================
-# Table Inflators
+# Table Inflators (5x)
 # ==========================================
 def inflate_stts(box, loop_count):
     data = box.data
@@ -311,6 +311,28 @@ def inflate_trak(trak, loop_count):
             new_trak_children.append(child)
     return Box(b'trak', b'', new_trak_children)
 
+def inject_metadata(moov):
+    """Injects iOS metadata into moov to trick TikTok servers"""
+    udta_box = None
+    for child in moov.children:
+        if child.box_type == b'udta':
+            udta_box = child
+            break
+    
+    if not udta_box:
+        udta_box = Box(b'udta', b'', [])
+        moov.children.append(udta_box)
+    else:
+        udta_box.children = [] # Clear old metadata
+        
+    # iPhone 13 Pro Max metadata spoofing
+    udta_box.children.append(Box(b'\xa9too', b'15.2'))
+    udta_box.children.append(Box(b'\xa9mak', b'Apple'))
+    udta_box.children.append(Box(b'\xa9mod', b'iPhone13,3'))
+    udta_box.children.append(Box(b'\xa9swr', b'15.2'))
+    
+    return moov
+
 def inflate_moov(moov, loop_count):
     new_moov_children = []
     for child in moov.children:
@@ -318,11 +340,17 @@ def inflate_moov(moov, loop_count):
             new_moov_children.append(inflate_mvhd(child, loop_count))
         elif child.box_type == b'trak':
             new_moov_children.append(inflate_trak(child, loop_count))
+        elif child.box_type == b'udta':
+            # Skip old metadata, we will inject fresh
+            continue
         else:
             new_moov_children.append(child)
-    return Box(b'moov', b'', new_moov_children)
+            
+    moov = Box(b'moov', b'', new_moov_children)
+    moov = inject_metadata(moov)
+    return moov
 
-def inflate_sample_table_video(data, loop_count=10):
+def inflate_sample_table_video(data, loop_count=5):
     moov_off, moov_sz = _find_box(data, b'moov')
     if moov_off == -1:
         return data
@@ -341,7 +369,7 @@ def inflate_sample_table_video(data, loop_count=10):
     return bytes(new_data)
 
 # ==========================================
-# Offset Adjuster & reloov_end
+# Offset Adjuster & Faststart
 # ==========================================
 def _find_box(data, box_type, start=0, end=None):
     if end is None:
@@ -407,50 +435,53 @@ def _adjust_stco(data, delta, start, end):
                 
         pos += size
 
-def reloov_end(data):
-    """Moves moov to end. NOTE: For TikTok, it is usually better to keep moov at the beginning (faststart)."""
+def faststart(data):
+    """Moves moov atom to the beginning of the file. Crucial for TikTok ingestion."""
     ftyp_off, ftyp_sz = _find_box(data, b'ftyp')
     moov_off, moov_sz = _find_box(data, b'moov')
-    if -1 in (ftyp_off, moov_off) or ftyp_off != 0:
-        return data
-
-    rest = bytearray()
-    pos = 0
-    while pos + 8 <= len(data):
-        sz = int.from_bytes(data[pos:pos+4], 'big')
-        hdr = 8
-        if sz == 1:
-            if pos + 16 > len(data): break
-            sz = int.from_bytes(data[pos+8:pos+16], 'big')
-            hdr = 16
-        elif sz == 0:
-            break
-        if sz < hdr: break
-        btype = data[pos+4:pos+8]
-        if btype not in (b'ftyp', b'moov'):
-            rest.extend(data[pos:pos+sz])
-        pos += sz
-
-    new_data = bytearray()
-    new_data.extend(data[ftyp_off:ftyp_off+ftyp_sz])
-    new_data.extend(rest)
-    new_data.extend(data[moov_off:moov_off+moov_sz])
-
-    old_mdat_off, _ = _find_box(data, b'mdat')
-    new_mdat_off, _ = _find_box(bytes(new_data), b'mdat')
+    mdat_off, mdat_sz = _find_box(data, b'mdat')
     
-    if old_mdat_off != -1 and new_mdat_off != -1:
-        mdat_delta = new_mdat_off - old_mdat_off
-        new_moov_off = ftyp_sz + len(rest)
-        _adjust_stco(new_data, mdat_delta, new_moov_off, new_moov_off + moov_sz)
+    if -1 in (ftyp_off, moov_off, mdat_off):
+        return data
         
+    if moov_off < mdat_off:
+        return data # Already at front
+        
+    ftyp = data[ftyp_off:ftyp_off+ftyp_sz]
+    moov = data[moov_off:moov_off+moov_sz]
+    mdat = data[mdat_off:mdat_off+mdat_sz]
+    
+    # Collect any other top-level boxes (like free)
+    rest = b''
+    pos = ftyp_sz
+    while pos < len(data):
+        sz = int.from_bytes(data[pos:pos+4], 'big')
+        if pos == moov_off or pos == mdat_off:
+            pos += sz
+            continue
+        rest += data[pos:pos+sz]
+        pos += sz
+        
+    new_data = bytearray()
+    new_data.extend(ftyp)
+    new_data.extend(moov)
+    new_data.extend(rest)
+    new_data.extend(mdat)
+    
+    # Adjust stco offsets
+    new_mdat_off = ftyp_sz + moov_sz + len(rest)
+    delta = new_mdat_off - mdat_off
+    
+    moov_start = ftyp_sz
+    _adjust_stco(new_data, delta, moov_start, moov_start + moov_sz)
+    
     return bytes(new_data)
 
 # ==========================================
 # Main Entry Points (File I/O Wrappers)
 # ==========================================
 def tikquick_encode(input_path, output_path, log_func=None, **kwargs):
-    """Re-encodes the video to strict TikTok-preferred specs to prevent server compression."""
+    """Re-encodes the video to strict TikTok-preferred specs."""
     try:
         if not shutil.which("ffmpeg"):
             if log_func: log_func("[ERROR] ffmpeg not found in PATH.")
@@ -458,7 +489,6 @@ def tikquick_encode(input_path, output_path, log_func=None, **kwargs):
             
         if log_func: log_func("[ENCODE] Starting TikQuick quality encode (1080x1920, 30fps, H.264)...")
         
-        # Strict TikTok specs: 1080 width, max 6Mbps bitrate, 30fps, yuv420p, faststart (moov at beginning)
         cmd = [
             "ffmpeg", "-y", "-i", str(input_path),
             "-c:v", "libx264", "-profile:v", "high", "-level", "4.0",
@@ -466,8 +496,7 @@ def tikquick_encode(input_path, output_path, log_func=None, **kwargs):
             "-maxrate", "6M", "-bufsize", "12M",
             "-vf", "scale='if(gt(iw,ih),1080,-2)':'if(gt(iw,ih),-2,1920)',fps=30,format=yuv420p",
             "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
-            "-movflags", "+faststart",  # Puts moov at the BEGINNING (Crucial for TikTok)
-            str(output_path)
+            str(output_path) # No +faststart here, we do it in Python!
         ]
         
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -490,13 +519,11 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='infl
             data = f.read()
             
         if method == 'inflate':
-            if log_func: log_func("[PATCH] Inflating sample tables 10x...")
-            data = inflate_sample_table_video(data, loop_count=10)
+            if log_func: log_func("[PATCH] Inflating sample tables 5x...")
+            data = inflate_sample_table_video(data, loop_count=5)
             
-        # For TikTok, moov should ideally be at the beginning (handled by ffmpeg +faststart during encode).
-        # If you still want to force moov to the end, uncomment the next 2 lines:
-        # if log_func: log_func("[PATCH] Relocating moov to end and fixing offsets...")
-        # data = reloov_end(data)
+        if log_func: log_func("[PATCH] Moving moov atom to beginning (faststart)...")
+        data = faststart(data)
         
         if comment:
             if log_func: log_func(f"[PATCH] Comment received but injection is skipped in this build.")
