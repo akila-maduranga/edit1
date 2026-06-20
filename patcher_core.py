@@ -475,17 +475,98 @@ def _patch_avcC_sps(data):
 
 # ── Frame Count Inflation (5x, filler NALs, full table rebuild) ──────
 
+def _inflate_ctts(data, ctts_off, ctts_sz, real_count, multiplier):
+    """Build an inflated ctts box where each original sample is repeated multiplier times.
+    ctts v0/v1: [header(8)] [version+flags(4)] [entry_count(4)] [(sample_count(4), sample_offset(4))...]
+    We repeat each entry's (count, offset) pair multiplier times.
+    """
+    hdr_sz = _box_hdr_sz(data, ctts_off)
+    version = data[ctts_off + hdr_sz]  # first byte of FullBox content
+    entry_count = int.from_bytes(data[ctts_off + hdr_sz + 4:ctts_off + hdr_sz + 8], 'big')
+    entries_start = ctts_off + hdr_sz + 8
+
+    # Read original entries
+    orig_entries = []
+    for i in range(entry_count):
+        off = entries_start + i * 8
+        count = int.from_bytes(data[off:off+4], 'big')
+        offset = int.from_bytes(data[off+4:off+8], 'big')
+        orig_entries.append((count, offset))
+
+    # Build inflated entries: repeat each entry multiplier times
+    new_entries = bytearray()
+    for count, offset in orig_entries:
+        for _ in range(multiplier):
+            new_entries.extend(struct.pack('>Ii', count, offset))
+
+    new_entry_count = entry_count * multiplier
+    new_body_size = 8 + 8 * new_entry_count  # version+flags(4) + entry_count(4) + entries
+    new_ctts = bytearray(hdr_sz + new_body_size)
+    # Header
+    if hdr_sz == 16:
+        struct.pack_into('>I', new_ctts, 0, 1)
+        new_ctts[4:8] = b'ctts'
+        struct.pack_into('>Q', new_ctts, 8, len(new_ctts))
+    else:
+        struct.pack_into('>I4s', new_ctts, 0, len(new_ctts), b'ctts')
+    # FullBox content
+    new_ctts[hdr_sz] = version
+    new_ctts[hdr_sz+1:hdr_sz+4] = b'\x00\x00\x00'
+    struct.pack_into('>I', new_ctts, hdr_sz + 4, new_entry_count)
+    new_ctts[hdr_sz + 8:] = new_entries
+    return bytes(new_ctts)
+
+
+def _inflate_stss(data, stss_off, stss_sz, real_count, multiplier):
+    """Build an inflated stss box where each sync sample number is repeated for
+    each of the multiplier copies. stss: [header(8)] [version+flags(4)] [entry_count(4)] [sample_numbers(4)...]
+    If original has sync sample at position P, the inflated version has sync samples
+    at P, P+real_count, P+2*real_count, ..., P+(multiplier-1)*real_count.
+    """
+    hdr_sz = _box_hdr_sz(data, stss_off)
+    entry_count = int.from_bytes(data[stss_off + hdr_sz + 4:stss_off + hdr_sz + 8], 'big')
+    numbers_start = stss_off + hdr_sz + 8
+
+    # Read original sync sample numbers
+    orig_numbers = []
+    for i in range(entry_count):
+        off = numbers_start + i * 4
+        orig_numbers.append(int.from_bytes(data[off:off+4], 'big'))
+
+    # Build inflated: for each original sync sample N, add N, N+real_count, N+2*real_count, ...
+    new_numbers = []
+    for n in orig_numbers:
+        for m in range(multiplier):
+            new_numbers.append(n + m * real_count)
+
+    new_entry_count = len(new_numbers)
+    new_body_size = 8 + 4 * new_entry_count
+    new_stss = bytearray(hdr_sz + new_body_size)
+    if hdr_sz == 16:
+        struct.pack_into('>I', new_stss, 0, 1)
+        new_stss[4:8] = b'stss'
+        struct.pack_into('>Q', new_stss, 8, len(new_stss))
+    else:
+        struct.pack_into('>I4s', new_stss, 0, len(new_stss), b'stss')
+    new_stss[hdr_sz:hdr_sz+4] = b'\x00\x00\x00\x00'  # version 0, flags 0
+    struct.pack_into('>I', new_stss, hdr_sz + 4, new_entry_count)
+    for i, n in enumerate(new_numbers):
+        struct.pack_into('>I', new_stss, hdr_sz + 8 + i * 4, n)
+    return bytes(new_stss)
+
+
 def inflate_sample_table_video(data, multiplier=10):
-    """Minimal inflation: only inflate stsz entry count.
+    """Minimal inflation: inflate stsz entry count + ctts + stss for consistency.
 
     Keeps stts, stco, stsc, and all duration fields UNCHANGED.
     The decoder uses stco/stsc to determine the actual sample count and
     data layout, so it reads exactly the same bytes as the original.
-    The extra stsz entries are ignored — no duplicate decoding, no DPB
-    confusion, no artifacts.  TikTok sees the inflated stsz count.
+    The extra stsz/ctts/stss entries are ignored by decoders that use
+    stts as the authoritative sample count.
 
-    Also sets mvhd/tkhd/mdhd video durations to match the inflated count
-    (prevents TikTok's duration-doubling bug).
+    ctts and stss are also inflated to prevent strict players (iOS, Safari,
+    QuickTime, some Android players) from rejecting the file due to
+    sample count mismatches between tables.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
@@ -553,9 +634,8 @@ def inflate_sample_table_video(data, multiplier=10):
         else:
             real_sizes.append(0)
 
-    # --- Build new stsz only (stts/stco/stsc stay unchanged) ---
+    # --- Build new stsz ---
     total_count = real_count * multiplier
-
     new_stsz_body = bytearray(12 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     idx = 0
@@ -565,10 +645,25 @@ def inflate_sample_table_video(data, multiplier=10):
             idx += 1
     new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
-    # --- Replace ONLY stsz ---
+    # --- Build replacements list (stsz + ctts + stss if present) ---
     replacements = [
         (stsz_off, stsz_sz, new_stsz),
     ]
+
+    # Inflate ctts if present (B-frame composition offsets)
+    ctts_off, ctts_sz = _find_box(data, b"ctts", _box_content_off(data, stbl_off), stbl_end)
+    if ctts_off != -1:
+        new_ctts = _inflate_ctts(data, ctts_off, ctts_sz, real_count, multiplier)
+        replacements.append((ctts_off, ctts_sz, new_ctts))
+
+    # Inflate stss if present (sync sample / keyframe table)
+    stss_off, stss_sz = _find_box(data, b"stss", _box_content_off(data, stbl_off), stbl_end)
+    if stss_off != -1:
+        new_stss = _inflate_stss(data, stss_off, stss_sz, real_count, multiplier)
+        replacements.append((stss_off, stss_sz, new_stss))
+
+    # Sort replacements by offset so we can apply them in a single pass
+    replacements.sort(key=lambda r: r[0])
 
     moov_delta = sum(len(new) - old_sz for _, old_sz, new in replacements)
 
@@ -593,13 +688,6 @@ def inflate_sample_table_video(data, multiplier=10):
     mdat_off, _ = _find_box(bytes(result), b'mdat')
     if moov_off < mdat_off:
         _adjust_stco(result, moov_delta, _box_content_off(result, moov_off), new_moov_end)
-
-    # NOTE: We intentionally do NOT modify mvhd/tkhd/mdhd durations here.
-    # The original code had wrong field offsets (e.g. tkhd has no timescale
-    # field — it uses the movie timescale; mdhd timescale is at +20 not +24)
-    # which corrupted box headers and made files unopenable.
-    # Duration inflation can be re-added later with correct offsets if needed.
-    # The stsz inflation alone is sufficient for the TikTok bypass.
 
     return bytes(result)
 
