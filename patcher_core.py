@@ -1105,8 +1105,8 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
     if method == 'inflate':
         if log_func:
             log_func("")
-            log_func("── 9/9  Frame Count Inflation (4x, filler NALs) ─────────────────────────")
-        inflated = inflate_sample_table_video(data, multiplier=4)
+            log_func("── 9/9  Frame Count Inflation (5x, filler NALs) ─────────────────────────")
+        inflated = inflate_sample_table_video(data, multiplier=5)
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
