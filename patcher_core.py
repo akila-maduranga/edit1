@@ -248,11 +248,12 @@ def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count, entry_size
             sample_idx += 1
     return result
 
-def inflate_sample_table_video(data, multiplier=10, filler_type='nal'):
+def inflate_sample_table_video(data, multiplier=5, filler_type='nal', keep_tables=False):
     """Inflation — add fake frames to prevent TikTok re-encode.
     filler_type='nal': append H.264 filler NALs (512 bytes, fake_delta=750).
     filler_type='lastcopy': append copies of last real frame data (valid picture, fake_delta=750).
     filler_type='zero': zero-size frames, fake_delta=1.
+    keep_tables=True: keep original stco/stsc unchanged (minimal approach).
     Container durations clipped to real frames only.
     """
     moov_off, moov_sz = _find_box(data, b"moov")
@@ -368,11 +369,24 @@ def inflate_sample_table_video(data, multiplier=10, filler_type='nal'):
             mdat_extension = 0
             fill_off = 0
 
+        if keep_tables:
+            filler_data = b''
+            fake_sz = 0
+            mdat_extension = 0
+
         fake_dur_ticks = fake_count * fake_delta
 
-        new_stts_body = struct.pack('>II', 0, 2)
-        new_stts_body += struct.pack('>II', real_count, orig_last_delta)
-        new_stts_body += struct.pack('>II', fake_count, fake_delta)
+        if keep_tables:
+            avg_delta = max(int(orig_total_dur_ticks / real_count), 1)
+            dur_for_containers = total_count * avg_delta / video_timescale
+            new_stts_body = struct.pack('>II', 0, 2)
+            new_stts_body += struct.pack('>II', real_count, avg_delta)
+            new_stts_body += struct.pack('>II', fake_count, avg_delta)
+        else:
+            dur_for_containers = orig_total_dur_ticks / video_timescale
+            new_stts_body = struct.pack('>II', 0, 2)
+            new_stts_body += struct.pack('>II', real_count, orig_last_delta)
+            new_stts_body += struct.pack('>II', fake_count, fake_delta)
         new_stts = struct.pack('>I4s', 8 + len(new_stts_body), b'stts') + new_stts_body
 
         new_stsz_body = bytearray(20 + total_count * 4)
@@ -383,25 +397,27 @@ def inflate_sample_table_video(data, multiplier=10, filler_type='nal'):
             struct.pack_into('>I', new_stsz_body, 12 + (real_count + i) * 4, fake_sz)
         new_stsz = struct.pack('>I4s', 8 + len(new_stsz_body), b'stsz') + bytes(new_stsz_body)
 
-        new_stsc_body = struct.pack('>II', 0, 1)
-        new_stsc_body += struct.pack('>III', 1, 1, 1)
-        new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
-
-        new_stco_body2 = bytearray(8 + total_count * 4)
-        struct.pack_into('>II', new_stco_body2, 0, 0, total_count)
-        for i in range(real_count):
-            struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
-        for i in range(fake_count):
-            off = fill_off + i * fake_sz
-            struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, off)
-        new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
-
         replacements = [
             (stts_off, stts_sz, new_stts),
             (stsz_off, stsz_sz, new_stsz),
-            (stsc_off, stsc_sz, new_stsc),
-            (stco_off, stco_sz, new_stco2),
         ]
+        if not keep_tables:
+            new_stsc_body = struct.pack('>II', 0, 1)
+            new_stsc_body += struct.pack('>III', 1, 1, 1)
+            new_stsc = struct.pack('>I4s', 8 + len(new_stsc_body), b'stsc') + bytes(new_stsc_body)
+
+            new_stco_body2 = bytearray(8 + total_count * 4)
+            struct.pack_into('>II', new_stco_body2, 0, 0, total_count)
+            for i in range(real_count):
+                struct.pack_into('>I', new_stco_body2, 8 + i * 4, real_offsets[i])
+            for i in range(fake_count):
+                off = fill_off + i * fake_sz
+                struct.pack_into('>I', new_stco_body2, 8 + (real_count + i) * 4, off)
+            new_stco2 = struct.pack('>I4s', 8 + len(new_stco_body2), b'stco') + bytes(new_stco_body2)
+            replacements.extend([
+                (stsc_off, stsc_sz, new_stsc),
+                (stco_off, stco_sz, new_stco2),
+            ])
         replacements.sort(key=lambda x: x[0])
 
         moov_delta = sum(len(new) - old_sz for _, old_sz, new in replacements)
@@ -436,23 +452,21 @@ def inflate_sample_table_video(data, multiplier=10, filler_type='nal'):
         new_moov_end = moov_off + moov_sz + moov_delta
         _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
 
-        real_dur_sec = orig_total_dur_ticks / video_timescale
-
         mvhd_off, _ = _find_box(result, b"mvhd", moov_off+8, moov_off+moov_sz+moov_delta)
         if mvhd_off != -1:
             ver = result[mvhd_off+8]
             if ver == 0:
                 mvhd_ts = int.from_bytes(result[mvhd_off+20:mvhd_off+24], 'big')
-                mvhd_dur = min(int(real_dur_sec * mvhd_ts), 0xFFFFFFFF)
+                mvhd_dur = min(int(dur_for_containers * mvhd_ts), 0xFFFFFFFF)
                 result[mvhd_off+24:mvhd_off+28] = struct.pack('>I', mvhd_dur)
                 mvhd_ts_used = mvhd_ts
             else:
                 mvhd_ts = int.from_bytes(result[mvhd_off+28:mvhd_off+32], 'big')
-                mvhd_dur = int(real_dur_sec * mvhd_ts)
+                mvhd_dur = int(dur_for_containers * mvhd_ts)
                 result[mvhd_off+32:mvhd_off+40] = struct.pack('>Q', mvhd_dur)
                 mvhd_ts_used = mvhd_ts
 
-        trak_dur = min(int(real_dur_sec * mvhd_ts_used), 0xFFFFFFFF)
+        trak_dur = min(int(dur_for_containers * mvhd_ts_used), 0xFFFFFFFF)
         for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz+moov_delta):
             mdia_off_v, mdia_sz_v = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
             is_video = False
@@ -476,11 +490,11 @@ def inflate_sample_table_video(data, multiplier=10, filler_type='nal'):
                     ver = result[mdhd_off+8]
                     if ver == 0:
                         mdhd_ts = int.from_bytes(result[mdhd_off+20:mdhd_off+24], 'big')
-                        mdhd_dur = min(int(real_dur_sec * mdhd_ts), 0xFFFFFFFF)
+                        mdhd_dur = min(int(dur_for_containers * mdhd_ts), 0xFFFFFFFF)
                         result[mdhd_off+24:mdhd_off+28] = struct.pack('>I', mdhd_dur)
                     else:
                         mdhd_ts = int.from_bytes(result[mdhd_off+28:mdhd_off+32], 'big')
-                        mdhd_dur = int(real_dur_sec * mdhd_ts)
+                        mdhd_dur = int(dur_for_containers * mdhd_ts)
                         result[mdhd_off+32:mdhd_off+40] = struct.pack('>Q', mdhd_dur)
 
         return bytes(result)
@@ -1005,8 +1019,8 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
     if method == 'inflate':
         if log_func:
             log_func("")
-            log_func("── 8/8  Frame Count Inflation (10x) ────────────────────────────────")
-        inflated = inflate_sample_table_video(data, multiplier=10)
+            log_func("── 8/8  Frame Count Inflation (5x) ─────────────────────────────────")
+        inflated = inflate_sample_table_video(data, multiplier=5, keep_tables=True)
         if inflated is None:
             if log_func:
                 log_func("[ERROR] Frame inflation failed")
