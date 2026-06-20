@@ -241,7 +241,10 @@ def strip_udta(data):
     del data[udta_off:udta_off+udta_sz]
     new_moov_sz = moov_sz - udta_sz
     struct.pack_into('>I', data, moov_off, new_moov_sz)
-    _adjust_stco(data, -udta_sz, moov_off+8, moov_off+8+new_moov_sz)
+    # Only adjust stco if moov is before mdat (mdat moves when moov changes)
+    mdat_off, _ = _find_box(data, b"mdat")
+    if moov_off < mdat_off:
+        _adjust_stco(data, -udta_sz, moov_off+8, moov_off+8+new_moov_sz)
     return bytes(data)
 
 
@@ -783,7 +786,9 @@ def inject_comment_udta(data, comment):
 
     new_moov_sz = moov_sz + delta
     struct.pack_into('>I', result, moov_off, new_moov_sz)
-    _adjust_stco(result, delta, moov_off+8, moov_off+8+new_moov_sz)
+    mdat_off, _ = _find_box(result, b"mdat")
+    if moov_off < mdat_off:
+        _adjust_stco(result, delta, moov_off+8, moov_off+8+new_moov_sz)
 
     return bytes(result)
 
