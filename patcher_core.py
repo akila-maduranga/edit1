@@ -862,6 +862,8 @@ def add_balanced_sync_elst(data, multiplier=2):
 # ── Main 7-Pass Pipeline ──────────────────────────────────────────────
 
 def patch_all(input_path, output_path, comment=None, log_func=None, method='balanced-sync', use_inflation=None):
+    """8-pass pipeline. Inflation runs last (Pass 8) so all other modifications
+    (codec spoofing, fingerprinting, comment, audio restore) are applied first."""
     if use_inflation is not None:
         if use_inflation:
             method = 'inflate'
@@ -899,7 +901,7 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
     # ── Pass 1: Move moov to front (pure Python, preserves all metadata) ──
     if log_func:
         log_func("")
-        log_func("── 1/7  Python reloov (moov to front) ─────────────────────")
+        log_func("── 1/8  Python reloov (moov to front) ─────────────────────")
     data = bytearray(original_data)
     ftyp_off, ftyp_sz = _find_box(data, b"ftyp")
     moov_off, moov_sz = _find_box(data, b"moov")
@@ -948,35 +950,62 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
 
 
 
-    # ── Pass 3: mvhd Fingerprint ────────────────────────────────────────
+    # ── Pass 2: mvhd Fingerprint ────────────────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 2/7  mvhd Fingerprint (next_track_id=9999, fixed date) ──")
+        log_func("── 2/8  mvhd Fingerprint (next_track_id=9999, fixed date) ──")
     data = patch_mvhd_fingerprint(data)
     if log_func:
         log_func("[MVHD] done")
 
-    # ── Pass 4: Udta Strip (remove ffmpeg encoder tag) ──────────────────
+    # ── Pass 3: Udta Strip (remove ffmpeg encoder tag) ──────────────────
     if log_func:
         log_func("")
-        log_func("── 3/7  Udta Strip ─────────────────────────────────────────")
+        log_func("── 3/8  Udta Strip ─────────────────────────────────────────")
     data = strip_udta(data)
     if log_func:
         log_func("[UDTA] done")
 
-    # ── Pass 5: tkhd Fingerprint ────────────────────────────────────────
+    # ── Pass 4: tkhd Fingerprint ────────────────────────────────────────
     if log_func:
         log_func("")
-        log_func("── 4/7  tkhd Fingerprint (alternate_group) ────────────────")
+        log_func("── 4/8  tkhd Fingerprint (alternate_group) ────────────────")
     data = fingerprint_tkhd(data)
     if log_func:
         log_func("[TKHD] done")
 
-    # ── Pass 6: Bypass Method (Inflation / Balanced Sync / Codec Spoofing) ──
+    # ── Pass 5: Codec Spoofing (for all methods) ─────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 5/8  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
+    data = patch_stsd_codec(data)
+    data = patch_ftyp(data)
+    if log_func:
+        log_func("[CODEC] done")
+
+    # ── Pass 6: Comment Udta Injection ──────────────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 6/8  Comment Udta Injection ────────────────────────────")
+    data = inject_comment_udta(data, final_comment)
+    if log_func:
+        log_func(f"[COMMENT] injected ({final_comment!r})")
+
+    # ── Pass 7: Restore original audio duration ─────────────────────────
+    if log_func:
+        log_func("")
+        log_func("── 7/8  Audio Duration Restore ────────────────────────────")
+    data = patch_audio_duration(data, original_audio_dur)
+    if log_func:
+        log_func("[AUDIO] done")
+
+    # ── Pass 8: Bypass Method (Inflation / Balanced Sync) ───────────────
+    # Inflation runs LAST so all other modifications (fingerprinting, codec
+    # spoof, comment, audio restore) are applied first.
     if method == 'inflate':
         if log_func:
             log_func("")
-            log_func("── 5/7  Frame Count Inflation (5x, sequential, two-entry stts) ────────────────")
+            log_func("── 8/8  Frame Count Inflation (10x) ────────────────────────────────")
         inflated = inflate_sample_table_video(data, multiplier=10)
         if inflated is None:
             if log_func:
@@ -988,35 +1017,11 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
     elif method == 'balanced-sync':
         if log_func:
             log_func("")
-            log_func("── 5/7  Balanced Sync (Timescale Division + Playback Speed elst) ────────────")
+            log_func("── 8/8  Balanced Sync (Timescale Division + Playback Speed elst) ────────────")
         data = patch_timescale_multiplier(data, multiplier=2)
         data = add_balanced_sync_elst(data, multiplier=2)
         if log_func:
             log_func("[BALANCED-SYNC] done")
-    else:
-        if log_func:
-            log_func("")
-            log_func("── 5/7  Codec Spoofing (avc1→avc3, M4VH brand) ───────────────")
-        data = patch_stsd_codec(data)
-        data = patch_ftyp(data)
-        if log_func:
-            log_func("[CODEC] done")
-
-    # ── Pass 7: Comment Udta Injection ──────────────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 6/7  Comment Udta Injection ────────────────────────────")
-    data = inject_comment_udta(data, final_comment)
-    if log_func:
-        log_func(f"[COMMENT] injected ({final_comment!r})")
-
-    # ── Pass 8: Restore original audio duration ─────────────────────────
-    if log_func:
-        log_func("")
-        log_func("── 7/7  Audio Duration Restore ────────────────────────────")
-    data = patch_audio_duration(data, original_audio_dur)
-    if log_func:
-        log_func("[AUDIO] done")
 
     # Final verify
     if log_func:
