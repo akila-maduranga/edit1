@@ -458,16 +458,28 @@ def faststart(data):
     moov = data[moov_off:moov_off+moov_sz]
     mdat = data[mdat_off:mdat_off+mdat_sz]
     
-    # Collect any other top-level boxes (like free)
-    rest = b''
+    # Collect any other top-level boxes (like free) - SAFELY
+    rest = bytearray()
     pos = ftyp_sz
-    while pos < len(data):
-        sz = int.from_bytes(data[pos:pos+4], 'big')
+    while pos + 8 <= len(data):
+        size = int.from_bytes(data[pos:pos+4], 'big')
+        header_size = 8
+        if size == 1:
+            if pos + 16 > len(data): break
+            size = int.from_bytes(data[pos+8:pos+16], 'big')
+            header_size = 16
+        elif size == 0:
+            size = len(data) - pos
+            
+        if size < header_size or pos + size > len(data):
+            break
+            
         if pos == moov_off or pos == mdat_off:
-            pos += sz
+            pos += size
             continue
-        rest += data[pos:pos+sz]
-        pos += sz
+            
+        rest.extend(data[pos:pos+size])
+        pos += size
         
     new_data = bytearray()
     new_data.extend(ftyp)
