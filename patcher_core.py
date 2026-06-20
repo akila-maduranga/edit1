@@ -206,12 +206,15 @@ def fingerprint_tkhd(data):
 # ── Frame Inflation ────────────────────────────────────────────────────
 
 
-def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count):
-    """Expand chunk offsets to per-sample offsets using stsc + stsz."""
+def _sample_offsets(data, stco_off, stsc_off, stsz_off, sample_count, entry_size=4):
+    """Expand chunk offsets to per-sample offsets using stsc + stsz.
+    entry_size: 4 for stco (32-bit), 8 for co64 (64-bit).
+    """
     stco_count = int.from_bytes(data[stco_off+12:stco_off+16], 'big')
     offsets = []
     for i in range(stco_count):
-        offsets.append(int.from_bytes(data[stco_off+16+i*4:stco_off+20+i*4], 'big'))
+        off = stco_off + 16 + i * entry_size
+        offsets.append(int.from_bytes(data[off:off+entry_size], 'big'))
 
     uniform = int.from_bytes(data[stsz_off+12:stsz_off+16], 'big')
     sz_count = int.from_bytes(data[stsz_off+16:stsz_off+20], 'big')
@@ -296,6 +299,11 @@ def inflate_sample_table_video(data, multiplier=5, filler_type='nal'):
     stts_off, stts_sz = _find_box(data, b"stts", stbl_off+8, stbl_end)
     stsz_off, stsz_sz = _find_box(data, b"stsz", stbl_off+8, stbl_end)
     stco_off, stco_sz = _find_box(data, b"stco", stbl_off+8, stbl_end)
+    if stco_off == -1:
+        stco_off, stco_sz = _find_box(data, b"co64", stbl_off+8, stbl_end)
+        co_entry_size = 8
+    else:
+        co_entry_size = 4
     stsc_off, stsc_sz = _find_box(data, b"stsc", stbl_off+8, stbl_end)
 
     if -1 in (stts_off, stsz_off, stco_off, stsc_off):
@@ -320,7 +328,7 @@ def inflate_sample_table_video(data, multiplier=5, filler_type='nal'):
         total_count = min(int(real_count * multiplier), 0xFFFFFFFF)
         fake_count = total_count - real_count
 
-        real_offsets = _sample_offsets(data, stco_off, stsc_off, stsz_off, real_count)
+        real_offsets = _sample_offsets(data, stco_off, stsc_off, stsz_off, real_count, co_entry_size)
         if not real_offsets:
             return None
 
