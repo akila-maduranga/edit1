@@ -1,53 +1,53 @@
 # TikTok MP4 Patcher
 
-Frame-count inflation tool that prevents TikTok from re-encoding uploaded
-videos by making the encoder see an unusually high frame count.
+Prevents TikTok's duration-doubling bug when uploading stsz-inflated MP4 files.
+TikTok **always re-encodes** uploaded videos regardless of file structure.
 
 ## How it works
 
-TikTok's encoder skips re-encoding when it encounters a frame count well
-above its expected range. This tool inflates the video track's sample table
-(stts/stsz/stco) by 5×, appending H.264 filler NALs to the mdat box so
-each fake frame has valid (but empty) data. The encoder passes the file
-through without re-encoding.
+TikTok has a bug where it doubles the reported duration when stsz entry count
+exceeds the actual frame count. This tool inflates the sample table while
+keeping all duration fields (mvhd/tkhd/mdhd) consistent with the inflated count,
+preventing the duration-doubling bug.
 
-**Trade-off:** The inflated stts table adds ~31s of frozen-last-frame at
-the end of a 16s video (freeze ≈ real_duration × 2). This is inherent to
-the approach — TikTok always plays all stts entries.
+**Minimal approach:** inflate stts+stsz entry counts, set mvhd/tkhd/mdhd durations
+to match the new count. Keep original stco/stsc unchanged. Decoders ignore extra
+entries since no actual data is referenced.
 
 ## Pipeline
 
-1. **moov relocate** — moves moov atom to front of file (Python-based,
-   no ffmpeg dependency for remux)
+1. **moov relocate** — moves moov atom to front of file (pure Python)
 2. **mvhd fingerprint** — randomizes creation/modification times and
-   next_track_id to break surface-level fingerprints
-3. **udta strip** — removes ffmpeg/HandBrake encoder tags from user-data
-4. **tkhd fingerprint** — sets alternate_group to avoid track dedup
-5. **Frame inflation** — 5× sample table expansion with 512B NAL filler,
-   fake_delta=750, container durations clipped to real content
+   next_track_id to avoid fingerprinting
+3. **udta strip** — removes ffmpeg/HandBrake encoder tags
+4. **tkhd fingerprint** — sets alternate_group for all tracks to same ID
+5. **Bypass method** (choose one):
+   - `inflate` — inflate stts/stsz count (default 5×)
+   - `balanced-sync` — divide timescale + add playback-speed edit list
+   - `codec-spoof` — avc1→avc3, M4VH brand, fingerprint patches
 6. **Comment injection** — embeds iTunes-style metadata comment
 7. **Audio duration fix** — restores original audio track duration
 
 ## Requirements
 
 - Python 3.10+
-- `ffmpeg` on PATH (for `app.py` remux only; CLI works without it)
 
 ## Quick start (CLI)
 
 ```bash
-python patcher.py input.mp4 -o output.mp4 --inflate
+python patcher.py input.mp4 -o output.mp4 --method balanced-sync
 ```
 
 Flags:
-- `--inflate` — enable frame-count inflation (required for no-compress)
-- `--comment` — set metadata comment (default: `@akila`)
+- `--method` — bypass method: `balanced-sync` (default), `inflate`, or `codec-spoof`
+- `--comment` — set metadata comment
 - `-o` — output path (default: `patched_output.mp4`)
 
 ## Quick start (Web UI)
 
 ```bash
 pip install -r requirements.txt
+export PATCHER_AUTH_TOKEN=mysecret   # optional auth
 python app.py          # http://0.0.0.0:5000
 ```
 

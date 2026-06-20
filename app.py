@@ -4,7 +4,7 @@ TikTok MP4 Patcher — Self-hosted VPS tool
 Web frontend for patcher_core.
 """
 
-import uuid, threading, queue
+import uuid, threading, queue, os, time
 from pathlib import Path
 from flask import (
     Flask, request, render_template, jsonify,
@@ -12,6 +12,9 @@ from flask import (
 )
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB
+
+AUTH_TOKEN = os.environ.get("PATCHER_AUTH_TOKEN", "")
 
 BASE_DIR   = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -19,9 +22,21 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+JOB_TTL = 24 * 3600  # 24 hours
+
 _job_logs:   dict[str, queue.Queue] = {}
 _job_status: dict[str, str]         = {}
 _job_output: dict[str, str]         = {}
+_job_created: dict[str, float]      = {}
+
+
+def require_auth():
+    if not AUTH_TOKEN:
+        return None
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+    if token != AUTH_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+    return None
 
 
 def run_job(job_id: str, src: Path, original_name: str, comment: str):
@@ -58,12 +73,34 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str):
         log.put(None)
 
 
+def _cleanup_jobs():
+    now = time.time()
+    expired = [jid for jid, t in _job_created.items() if now - t > JOB_TTL]
+    for jid in expired:
+        _job_logs.pop(jid, None)
+        _job_status.pop(jid, None)
+        out_name = _job_output.pop(jid, None)
+        _job_created.pop(jid, None)
+        if out_name:
+            try: (OUTPUT_DIR / out_name).unlink(missing_ok=True)
+            except: pass
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
 @app.route("/")
 def index(): return render_template("index.html")
 
 
 @app.route("/upload", methods=["POST"])
 def upload():
+    resp = require_auth()
+    if resp:
+        return resp
+
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
     f = request.files["file"]
@@ -75,7 +112,9 @@ def upload():
     dest    = UPLOAD_DIR / f"{job_id}_input.mp4"
     f.save(dest)
 
+    _cleanup_jobs()
     _job_logs[job_id] = queue.Queue()
+    _job_created[job_id] = time.time()
     threading.Thread(target=run_job, args=(job_id, dest, f.filename, comment), daemon=True).start()
     return jsonify({"job_id": job_id})
 

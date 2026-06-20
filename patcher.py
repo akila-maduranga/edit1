@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-NoBlur-style TikTok bypass patcher — standalone CLI.
+TikTok MP4 Patcher — standalone CLI.
 
 Delegates all patching to patcher_core.patch_all (7-pass pipeline).
+Prevents TikTok duration-doubling bug via MP4 structure manipulation.
 """
 
 import sys
