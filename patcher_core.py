@@ -29,9 +29,17 @@ def _iter_boxes(data, start=0, end=None):
             break
         size = struct.unpack(">I", size_bytes)[0]
         btype = data[i+4:i+8]
-        if size == 0:
+        if size == 1:
+            if i + 16 > end:
+                break
+            size = struct.unpack(">Q", data[i+8:i+16])[0]
+            header_len = 16
+        elif size == 0:
             size = end - i
-        if size < 8 or size > end - i:
+            header_len = 8
+        else:
+            header_len = 8
+        if size < header_len or size > end - i:
             break
         yield i, size, btype
         i += size
@@ -100,13 +108,20 @@ def _dump_atoms(data, label="", log_func=None):
     while i + 8 <= len(data):
         size = int.from_bytes(data[i:i+4], 'big')
         kind = data[i+4:i+8]
-        if size == 0:
+        if size == 1:
+            if i + 16 > len(data):
+                break
+            size = int.from_bytes(data[i+8:i+16], 'big')
+            hdr = 16
+        elif size == 0:
             size = len(data) - i
-        if log_func:
-            log_func(f"  [{label}]  offset {i:>8}  size {size:>8}  {kind.decode('latin1', errors='replace')}")
-        i += size
-        if i >= len(data):
+            hdr = 8
+        else:
+            hdr = 8
+        if size < hdr:
             break
+        log_func(f"  [{label}]  offset {i:>8}  size {size:>10}  hdr {hdr}  {kind.decode('latin1', errors='replace')}")
+        i += size
 
 
 
@@ -890,7 +905,16 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
     pos = 0
     while pos + 8 <= len(data):
         sz = int.from_bytes(data[pos:pos+4], 'big')
-        if sz == 0: sz = len(data) - pos
+        hdr = 8
+        if sz == 1:
+            if pos + 16 > len(data):
+                break
+            sz = int.from_bytes(data[pos+8:pos+16], 'big')
+            hdr = 16
+        elif sz == 0:
+            sz = len(data) - pos
+        if sz < hdr:
+            break
         btype = data[pos+4:pos+8]
         if btype not in (b'ftyp', b'moov'):
             rest.extend(data[pos:pos+sz])
