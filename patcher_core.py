@@ -19,14 +19,32 @@ from pathlib import Path
 _SCRIPT_DIR = Path(__file__).parent
 
 
+def _box_hdr_sz(data, box_off):
+    """Return header size (8 or 16) for a box at the given offset."""
+    if box_off + 4 > len(data):
+        return 8
+    if int.from_bytes(data[box_off:box_off+4], 'big') == 1:
+        return 16  # 64-bit extended
+    return 8
+
+
+def _box_content_off(data, box_off):
+    """Return the offset where a box's content/children begin."""
+    return box_off + _box_hdr_sz(data, box_off)
+
+
+def _hdlr_type_off(data, hdlr_off):
+    """Return offset of the handler_type field inside an hdlr box.
+    hdlr is a FullBox: version+flags (4) + pre_defined (4) + handler_type (4).
+    The handler_type is always at (box_start + header_size + 8)."""
+    return hdlr_off + _box_hdr_sz(data, hdlr_off) + 8
+
+
 def _update_box_size(data, box_off, new_size):
     """Write new_size into a box header, handling 32-bit and 64-bit (extended) sizes."""
-    indicator = int.from_bytes(data[box_off:box_off+4], 'big')
-    if indicator == 1:
-        # 64-bit extended size: actual size is at bytes 8-15
+    if _box_hdr_sz(data, box_off) == 16:
         struct.pack_into('>Q', data, box_off + 8, new_size)
     else:
-        # 32-bit size
         struct.pack_into('>I', data, box_off, new_size)
 
 
@@ -80,7 +98,7 @@ def _adjust_stco(data, delta, search_start=0, search_end=None):
                     data[pos:pos+entry_size] = new_val.to_bytes(entry_size, 'big')
                     pos += entry_size
             elif sz > 8:
-                stack.append((off + 8, off + sz))
+                stack.append((_box_content_off(data, off), off + sz))
 
 
 def reloov_end(data):
@@ -117,7 +135,7 @@ def reloov_end(data):
     result.extend(data[ftyp_off:ftyp_off+ftyp_sz])
     result.extend(rest)
     result.extend(data[moov_off:moov_off+moov_sz])
-    _adjust_stco(result, mdat_delta, new_moov_off+8, new_moov_off+8+moov_sz)
+    _adjust_stco(result, mdat_delta, _box_content_off(result, new_moov_off), new_moov_off+moov_sz)
     # Debug: check if moov can be found
     test_moov = _find_box(result, b'moov')
     if test_moov == -1:
@@ -195,7 +213,7 @@ def patch_mvhd_fingerprint(data):
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
-    mvhd_off, _ = _find_box(data, b"mvhd", moov_off+8, moov_off+moov_sz)
+    mvhd_off, _ = _find_box(data, b"mvhd", _box_content_off(data, moov_off), moov_off+moov_sz)
     if mvhd_off == -1:
         return data
     p = bytearray(data)
@@ -221,7 +239,7 @@ def strip_udta(data):
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
-    udta_off, udta_sz = _find_box(data, b"udta", moov_off+8, moov_off+moov_sz)
+    udta_off, udta_sz = _find_box(data, b"udta", _box_content_off(data, moov_off), moov_off+moov_sz)
     if udta_off == -1:
         return data
     data = bytearray(data)
@@ -231,7 +249,7 @@ def strip_udta(data):
     # Only adjust stco if moov is before mdat (mdat moves when moov changes)
     mdat_off, _ = _find_box(data, b"mdat")
     if moov_off < mdat_off:
-        _adjust_stco(data, -udta_sz, moov_off+8, moov_off+8+new_moov_sz)
+        _adjust_stco(data, -udta_sz, _box_content_off(data, moov_off), moov_off+8+new_moov_sz)
     return bytes(data)
 
 
@@ -246,8 +264,8 @@ def fingerprint_tkhd(data):
         return data
     p = bytearray(data)
     group_id = 1
-    for trak_off, trak_sz, _ in _iter_boxes(p, moov_off+8, moov_off+moov_sz):
-        tkhd_off, _ = _find_box(p, b"tkhd", trak_off+8, trak_off+trak_sz)
+    for trak_off, trak_sz, _ in _iter_boxes(p, _box_content_off(p, moov_off), moov_off+moov_sz):
+        tkhd_off, _ = _find_box(p, b"tkhd", _box_content_off(p, trak_off), trak_off+trak_sz)
         if tkhd_off == -1:
             continue
         version = p[tkhd_off+8]
@@ -337,8 +355,8 @@ def rebuild_elst_bypass(data):
         return data
     data = bytearray(data)
     modifications = []
-    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        tkhd_off, _ = _find_box(data, b"tkhd", trak_off+8, trak_off+trak_sz)
+    for trak_off, trak_sz, _ in _iter_boxes(data, _box_content_off(data, moov_off), moov_off+moov_sz):
+        tkhd_off, _ = _find_box(data, b"tkhd", _box_content_off(data, trak_off), trak_off+trak_sz)
         if tkhd_off == -1:
             continue
         version = data[tkhd_off+8]
@@ -346,10 +364,10 @@ def rebuild_elst_bypass(data):
             duration = int.from_bytes(data[tkhd_off+36:tkhd_off+44], 'big')
         else:
             duration = int.from_bytes(data[tkhd_off+28:tkhd_off+32], 'big')
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        mdia_off, mdia_sz = _find_box(data, b"mdia", _box_content_off(data, trak_off), trak_off+trak_sz)
         if mdia_off == -1:
             continue
-        mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+        mdhd_off, _ = _find_box(data, b"mdhd", _box_content_off(data, mdia_off), mdia_off+mdia_sz)
         media_time = 0
         if mdhd_off != -1:
             v = data[mdhd_off+8]
@@ -358,7 +376,7 @@ def rebuild_elst_bypass(data):
             if timescale == 90000:
                 media_time = 6000
         edts_bytes = build_edts_atom(duration, media_time)
-        edts_off, edts_sz = _find_box(data, b"edts", trak_off+8, trak_off+trak_sz)
+        edts_off, edts_sz = _find_box(data, b"edts", _box_content_off(data, trak_off), trak_off+trak_sz)
         if edts_off != -1:
             modifications.append((edts_off, edts_sz, edts_bytes, trak_off))
         else:
@@ -392,7 +410,7 @@ def rebuild_elst_bypass(data):
         i = j
     moov_read = int.from_bytes(new_data[moov_off:moov_off+4], 'big')
     _update_box_size(new_data, moov_off, moov_read + total_delta)
-    _adjust_stco(new_data, total_delta, moov_off+8, moov_off+8+moov_sz+total_delta)
+    _adjust_stco(new_data, total_delta, _box_content_off(new_data, moov_off), moov_off+8+moov_sz+total_delta)
     return bytes(new_data)
 
 
@@ -402,20 +420,20 @@ def _patch_avcC_sps(data):
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
-    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+    for trak_off, trak_sz, _ in _iter_boxes(data, _box_content_off(data, moov_off), moov_off+moov_sz):
+        mdia_off, mdia_sz = _find_box(data, b"mdia", _box_content_off(data, trak_off), trak_off+trak_sz)
         if mdia_off == -1:
             continue
-        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
+        hdlr_off, _ = _find_box(data, b"hdlr", _box_content_off(data, mdia_off), mdia_off+mdia_sz)
+        if hdlr_off == -1 or data[_hdlr_type_off(data, hdlr_off):_hdlr_type_off(data, hdlr_off)+4] != b'vide':
             continue
-        minf_off, minf_sz = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        minf_off, minf_sz = _find_box(data, b"minf", _box_content_off(data, mdia_off), mdia_off+mdia_sz)
         if minf_off == -1:
             continue
-        stbl_off, stbl_sz = _find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        stbl_off, stbl_sz = _find_box(data, b"stbl", _box_content_off(data, minf_off), minf_off+minf_sz)
         if stbl_off == -1:
             continue
-        stsd_off, _ = _find_box(data, b"stsd", stbl_off+8, stbl_off+stbl_sz)
+        stsd_off, _ = _find_box(data, b"stsd", _box_content_off(data, stbl_off), stbl_off+stbl_sz)
         if stsd_off == -1:
             continue
         stsd_end = stsd_off + int.from_bytes(data[stsd_off:stsd_off+4], 'big')
@@ -463,17 +481,17 @@ def inflate_sample_table_video(data, multiplier=10):
 
     video_stbl = None
     video_trak_off = None
-    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+    for trak_off, trak_sz, _ in _iter_boxes(data, _box_content_off(data, moov_off), moov_off+moov_sz):
+        mdia_off, mdia_sz = _find_box(data, b"mdia", _box_content_off(data, trak_off), trak_off+trak_sz)
         if mdia_off == -1:
             continue
-        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
+        hdlr_off, _ = _find_box(data, b"hdlr", _box_content_off(data, mdia_off), mdia_off+mdia_sz)
+        if hdlr_off == -1 or data[_hdlr_type_off(data, hdlr_off):_hdlr_type_off(data, hdlr_off)+4] != b'vide':
             continue
-        minf_off, minf_sz = _find_box(data, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        minf_off, minf_sz = _find_box(data, b"minf", _box_content_off(data, mdia_off), mdia_off+mdia_sz)
         if minf_off == -1:
             continue
-        stbl_off, stbl_sz = _find_box(data, b"stbl", minf_off+8, minf_off+minf_sz)
+        stbl_off, stbl_sz = _find_box(data, b"stbl", _box_content_off(data, minf_off), minf_off+minf_sz)
         if stbl_off == -1:
             continue
         video_stbl = (stbl_off, stbl_sz, trak_off, mdia_off, minf_off)
@@ -486,12 +504,12 @@ def inflate_sample_table_video(data, multiplier=10):
     stbl_off, stbl_sz, trak_off, mdia_off, minf_off = video_stbl
     stbl_end = stbl_off + stbl_sz
 
-    stsz_off, stsz_sz = _find_box(data, b"stsz", stbl_off+8, stbl_end)
+    stsz_off, stsz_sz = _find_box(data, b"stsz", _box_content_off(data, stbl_off), stbl_end)
     if stsz_off == -1:
         return None
 
     # --- Read original stts to get real frame count and delta for duration calc ---
-    stts_off, stts_sz = _find_box(data, b"stts", stbl_off+8, stbl_end)
+    stts_off, stts_sz = _find_box(data, b"stts", _box_content_off(data, stbl_off), stbl_end)
     real_count = 0
     real_delta = 0
     if stts_off != -1:
@@ -526,7 +544,7 @@ def inflate_sample_table_video(data, multiplier=10):
     # --- Build new stsz only (stts/stco/stsc stay unchanged) ---
     total_count = real_count * multiplier
 
-    new_stsz_body = bytearray(20 + total_count * 4)
+    new_stsz_body = bytearray(12 + total_count * 4)
     struct.pack_into('>III', new_stsz_body, 0, 0, 0, total_count)
     idx = 0
     for sz in real_sizes:
@@ -564,7 +582,7 @@ def inflate_sample_table_video(data, multiplier=10):
     new_moov_end = moov_off + moov_sz + moov_delta
     mdat_off, _ = _find_box(bytes(result), b'mdat')
     if moov_off < mdat_off:
-        _adjust_stco(result, moov_delta, moov_off+8, new_moov_end)
+        _adjust_stco(result, moov_delta, _box_content_off(result, moov_off), new_moov_end)
 
     # NOTE: We intentionally do NOT modify mvhd/tkhd/mdhd durations here.
     # The original code had wrong field offsets (e.g. tkhd has no timescale
@@ -627,7 +645,7 @@ def inject_comment_udta(data, comment):
     _update_box_size(result, moov_off, new_moov_sz)
     mdat_off, _ = _find_box(result, b"mdat")
     if moov_off < mdat_off:
-        _adjust_stco(result, delta, moov_off+8, moov_off+8+new_moov_sz)
+        _adjust_stco(result, delta, _box_content_off(result, moov_off), moov_off+8+new_moov_sz)
 
     return bytes(result)
 
@@ -638,19 +656,19 @@ def read_audio_duration(data):
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
-    for trak_off, trak_sz, tt in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+    for trak_off, trak_sz, tt in _iter_boxes(data, _box_content_off(data, moov_off), moov_off+moov_sz):
         if tt != b"trak":
             continue
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        mdia_off, mdia_sz = _find_box(data, b"mdia", _box_content_off(data, trak_off), trak_off+trak_sz)
         if mdia_off == -1:
             continue
-        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        hdlr_off, _ = _find_box(data, b"hdlr", _box_content_off(data, mdia_off), mdia_off+mdia_sz)
         if hdlr_off == -1:
             continue
         if hdlr_off + 20 > len(data):
             continue
-        if data[hdlr_off+16:hdlr_off+20] == b'soun':
-            mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+        if data[_hdlr_type_off(data, hdlr_off):_hdlr_type_off(data, hdlr_off)+4] == b'soun':
+            mdhd_off, _ = _find_box(data, b"mdhd", _box_content_off(data, mdia_off), mdia_off+mdia_sz)
             if mdhd_off == -1:
                 continue
             version = data[mdhd_off+8]
@@ -671,19 +689,19 @@ def patch_audio_duration(data, original_duration):
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return data
-    for trak_off, trak_sz, tt in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
+    for trak_off, trak_sz, tt in _iter_boxes(data, _box_content_off(data, moov_off), moov_off+moov_sz):
         if tt != b"trak":
             continue
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+        mdia_off, mdia_sz = _find_box(data, b"mdia", _box_content_off(data, trak_off), trak_off+trak_sz)
         if mdia_off == -1:
             continue
-        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        hdlr_off, _ = _find_box(data, b"hdlr", _box_content_off(data, mdia_off), mdia_off+mdia_sz)
         if hdlr_off == -1:
             continue
         if hdlr_off + 20 > len(data):
             continue
-        if data[hdlr_off+16:hdlr_off+20] == b'soun':
-            mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+        if data[_hdlr_type_off(data, hdlr_off):_hdlr_type_off(data, hdlr_off)+4] == b'soun':
+            mdhd_off, _ = _find_box(data, b"mdhd", _box_content_off(data, mdia_off), mdia_off+mdia_sz)
             if mdhd_off == -1:
                 continue
             version = data[mdhd_off+8]
@@ -719,22 +737,22 @@ def patch_stsd_codec(data):
     moov_off, moov_sz = _find_box(result, b"moov")
     if moov_off == -1:
         return data
-    for trak_off, trak_sz, _ in _iter_boxes(result, moov_off+8, moov_off+moov_sz):
-        mdia_off, mdia_sz = _find_box(result, b"mdia", trak_off+8, trak_off+trak_sz)
+    for trak_off, trak_sz, _ in _iter_boxes(result, _box_content_off(result, moov_off), moov_off+moov_sz):
+        mdia_off, mdia_sz = _find_box(result, b"mdia", _box_content_off(result, trak_off), trak_off+trak_sz)
         if mdia_off == -1:
             continue
-        hdlr_off, _ = _find_box(result, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
+        hdlr_off, _ = _find_box(result, b"hdlr", _box_content_off(result, mdia_off), mdia_off+mdia_sz)
         if hdlr_off == -1:
             continue
-        if result[hdlr_off+16:hdlr_off+20] != b'vide':
+        if result[_hdlr_type_off(result, hdlr_off):_hdlr_type_off(result, hdlr_off)+4] != b'vide':
             continue
-        minf_off, minf_sz = _find_box(result, b"minf", mdia_off+8, mdia_off+mdia_sz)
+        minf_off, minf_sz = _find_box(result, b"minf", _box_content_off(result, mdia_off), mdia_off+mdia_sz)
         if minf_off == -1:
             continue
-        stbl_off, stbl_sz = _find_box(result, b"stbl", minf_off+8, minf_off+minf_sz)
+        stbl_off, stbl_sz = _find_box(result, b"stbl", _box_content_off(result, minf_off), minf_off+minf_sz)
         if stbl_off == -1:
             continue
-        stsd_off, stsd_sz = _find_box(result, b"stsd", stbl_off+8, stbl_off+stbl_sz)
+        stsd_off, stsd_sz = _find_box(result, b"stsd", _box_content_off(result, stbl_off), stbl_off+stbl_sz)
         if stsd_off == -1:
             continue
         entry_off = stsd_off + 16
@@ -750,7 +768,7 @@ def find_mvhd_timescale(data):
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
-    mvhd_off, _ = _find_box(data, b"mvhd", moov_off+8, moov_off+moov_sz)
+    mvhd_off, _ = _find_box(data, b"mvhd", _box_content_off(data, moov_off), moov_off+moov_sz)
     if mvhd_off == -1:
         return None
     ver = data[mvhd_off+8]
@@ -768,14 +786,14 @@ def find_video_mdhd_timescale(data):
     moov_off, moov_sz = _find_box(data, b"moov")
     if moov_off == -1:
         return None
-    for trak_off, trak_sz, _ in _iter_boxes(data, moov_off+8, moov_off+moov_sz):
-        mdia_off, mdia_sz = _find_box(data, b"mdia", trak_off+8, trak_off+trak_sz)
+    for trak_off, trak_sz, _ in _iter_boxes(data, _box_content_off(data, moov_off), moov_off+moov_sz):
+        mdia_off, mdia_sz = _find_box(data, b"mdia", _box_content_off(data, trak_off), trak_off+trak_sz)
         if mdia_off == -1:
             continue
-        hdlr_off, _ = _find_box(data, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1 or data[hdlr_off+16:hdlr_off+20] != b'vide':
+        hdlr_off, _ = _find_box(data, b"hdlr", _box_content_off(data, mdia_off), mdia_off+mdia_sz)
+        if hdlr_off == -1 or data[_hdlr_type_off(data, hdlr_off):_hdlr_type_off(data, hdlr_off)+4] != b'vide':
             continue
-        mdhd_off, _ = _find_box(data, b"mdhd", mdia_off+8, mdia_off+mdia_sz)
+        mdhd_off, _ = _find_box(data, b"mdhd", _box_content_off(data, mdia_off), mdia_off+mdia_sz)
         if mdhd_off == -1:
             return None
         ver = data[mdhd_off+8]
@@ -825,8 +843,8 @@ def patch_timescale_multiplier(data, multiplier=2):
             struct.pack_into('>Q', p, dur_off, new_dur)
 
     # Divide tkhd duration by multiplier for all tracks
-    for trak_off, trak_sz, _ in _iter_boxes(p, moov_off+8, moov_off+moov_sz):
-        tkhd_off, _ = _find_box(p, b"tkhd", trak_off+8, trak_off+trak_sz)
+    for trak_off, trak_sz, _ in _iter_boxes(p, _box_content_off(p, moov_off), moov_off+moov_sz):
+        tkhd_off, _ = _find_box(p, b"tkhd", _box_content_off(p, trak_off), trak_off+trak_sz)
         if tkhd_off != -1:
             ver = p[tkhd_off+8]
             if ver == 0:
@@ -857,12 +875,12 @@ def add_balanced_sync_elst(data, multiplier=2):
     p = bytearray(data)
     moov_end = moov_off + moov_sz
 
-    for trak_off, trak_sz, _ in _iter_boxes(p, moov_off+8, moov_off+moov_sz):
-        mdia_off, mdia_sz = _find_box(p, b"mdia", trak_off+8, trak_off+trak_sz)
+    for trak_off, trak_sz, _ in _iter_boxes(p, _box_content_off(p, moov_off), moov_off+moov_sz):
+        mdia_off, mdia_sz = _find_box(p, b"mdia", _box_content_off(p, trak_off), trak_off+trak_sz)
         if mdia_off == -1:
             continue
-        hdlr_off, _ = _find_box(p, b"hdlr", mdia_off+8, mdia_off+mdia_sz)
-        if hdlr_off == -1 or p[hdlr_off+16:hdlr_off+20] != b'vide':
+        hdlr_off, _ = _find_box(p, b"hdlr", _box_content_off(p, mdia_off), mdia_off+mdia_sz)
+        if hdlr_off == -1 or p[_hdlr_type_off(p, hdlr_off):_hdlr_type_off(p, hdlr_off)+4] != b'vide':
             continue
 
         # Segment duration in movie timescale
@@ -897,7 +915,7 @@ def add_balanced_sync_elst(data, multiplier=2):
         delta = len(edts_bytes)
 
         # Check if trak already has edts
-        edts_off, edts_sz = _find_box(p, b"edts", trak_off+8, trak_off+trak_sz)
+        edts_off, edts_sz = _find_box(p, b"edts", _box_content_off(p, trak_off), trak_off+trak_sz)
         if edts_off != -1:
             old_edts = p[edts_off:edts_off+edts_sz]
             if old_edts == edts_bytes:
@@ -914,7 +932,7 @@ def add_balanced_sync_elst(data, multiplier=2):
         else:
             # Insert edts at beginning of trak (right after trak header)
             new_data = bytearray(len(p) + delta)
-            insert_pos = trak_off + 8
+            insert_pos = _box_content_off(p, trak_off)
             new_data[:insert_pos] = p[:insert_pos]
             new_data[insert_pos:insert_pos+delta] = edts_bytes
             new_data[insert_pos+delta:] = p[insert_pos:]
@@ -926,7 +944,7 @@ def add_balanced_sync_elst(data, multiplier=2):
         if old_moov_read == 1:
             old_moov_read = int.from_bytes(p[moov_off+8:moov_off+16], 'big')
         _update_box_size(p, moov_off, old_moov_read + delta)
-        _adjust_stco(p, delta, moov_off+8, moov_off+8+old_moov_read+delta)
+        _adjust_stco(p, delta, _box_content_off(p, moov_off), moov_off+8+old_moov_read+delta)
         moov_end = moov_off + old_moov_read + delta
 
     return bytes(p)
