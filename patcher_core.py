@@ -24,11 +24,14 @@ def _iter_boxes(data, start=0, end=None):
         end = len(data)
     i = start
     while i + 8 <= end:
-        size = struct.unpack(">I", data[i:i+4])[0]
+        size_bytes = data[i:i+4]
+        if len(size_bytes) < 4:
+            break
+        size = struct.unpack(">I", size_bytes)[0]
         btype = data[i+4:i+8]
         if size == 0:
             size = end - i
-        if size < 8:
+        if size < 8 or size > end - i:
             break
         yield i, size, btype
         i += size
@@ -44,17 +47,21 @@ def _find_box(data, box_type, start=0, end=None):
 def _adjust_stco(data, delta, search_start=0, search_end=None):
     if search_end is None:
         search_end = len(data)
-    for off, sz, btype in _iter_boxes(data, search_start, search_end):
-        if btype not in (b'stco', b'co64'):
-            continue
-        entry_size = 4 if btype == b'stco' else 8
-        entry_count = int.from_bytes(data[off+12:off+16], 'big')
-        pos = off + 16
-        for _ in range(entry_count):
-            old = int.from_bytes(data[pos:pos+entry_size], 'big')
-            new_val = min(max(old + delta, 0), (1 << (8 * entry_size)) - 1)
-            data[pos:pos+entry_size] = new_val.to_bytes(entry_size, 'big')
-            pos += entry_size
+    stack = [(search_start, search_end)]
+    while stack:
+        start, end = stack.pop()
+        for off, sz, btype in _iter_boxes(data, start, end):
+            if btype in (b'stco', b'co64'):
+                entry_size = 4 if btype == b'stco' else 8
+                entry_count = int.from_bytes(data[off+12:off+16], 'big')
+                pos = off + 16
+                for _ in range(entry_count):
+                    old = int.from_bytes(data[pos:pos+entry_size], 'big')
+                    new_val = min(max(old + delta, 0), (1 << (8 * entry_size)) - 1)
+                    data[pos:pos+entry_size] = new_val.to_bytes(entry_size, 'big')
+                    pos += entry_size
+            elif sz > 8:
+                stack.append((off + 8, off + sz))
 
 
 def validate_mp4(data):
