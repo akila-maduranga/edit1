@@ -109,7 +109,6 @@ def inflate_stsc(box, loop_count, orig_total_chunks):
             samples_per_chunk = struct.unpack('>I', entries[offset+4:offset+8])[0]
             sample_desc_idx = struct.unpack('>I', entries[offset+8:offset+12])[0]
             
-            # Shift first_chunk index for each loop iteration
             new_first_chunk = first_chunk + (i * orig_total_chunks)
             new_entries += struct.pack('>III', new_first_chunk, samples_per_chunk, sample_desc_idx)
             
@@ -170,7 +169,6 @@ def inflate_stss(box, loop_count, orig_total_samples):
         for j in range(entry_count):
             offset = j * 4
             sample_num = struct.unpack('>I', entries[offset:offset+4])[0]
-            # Shift 1-based sync sample indices
             new_sample_num = sample_num + (i * orig_total_samples)
             new_entries += struct.pack('>I', new_sample_num)
             
@@ -316,14 +314,12 @@ def inflate_moov(moov, loop_count):
         if child.box_type == b'mvhd':
             new_moov_children.append(inflate_mvhd(child, loop_count))
         elif child.box_type == b'trak':
-            # Inflate ALL tracks to ensure audio/video remain perfectly in sync
             new_moov_children.append(inflate_trak(child, loop_count))
         else:
             new_moov_children.append(child)
     return Box(b'moov', b'', new_moov_children)
 
 def inflate_sample_table_video(data, loop_count=10):
-    """Finds the moov box, rebuilds all sample tables, and returns the patched file."""
     moov_off, moov_sz = _find_box(data, b'moov')
     if moov_off == -1:
         return data
@@ -369,7 +365,6 @@ def _find_box(data, box_type, start=0, end=None):
     return -1, 0
 
 def _adjust_stco(data, delta, start, end):
-    """Recursively scans for and adjusts stco/co64 entries within the given byte range."""
     pos = start
     while pos + 8 <= end:
         size = int.from_bytes(data[pos:pos+4], 'big')
@@ -386,7 +381,6 @@ def _adjust_stco(data, delta, start, end):
             
         btype = data[pos+4:pos+8]
         
-        # Recurse into standard container boxes
         if btype in (b'moov', b'trak', b'mdia', b'minf', b'stbl', b'edts', b'udta', b'dinf', b'mvex'):
             _adjust_stco(data, delta, pos + header_size, pos + size)
         elif btype == b'stco':
@@ -411,13 +405,11 @@ def _adjust_stco(data, delta, start, end):
         pos += size
 
 def reloov_end(data):
-    """Move moov to end of file, correctly adjusting stco offsets."""
     ftyp_off, ftyp_sz = _find_box(data, b'ftyp')
     moov_off, moov_sz = _find_box(data, b'moov')
     if -1 in (ftyp_off, moov_off) or ftyp_off != 0:
         return data
 
-    # Collect all boxes except ftyp and moov
     rest = bytearray()
     pos = 0
     while pos + 8 <= len(data):
@@ -435,13 +427,11 @@ def reloov_end(data):
             rest.extend(data[pos:pos+sz])
         pos += sz
 
-    # New layout: ftyp + rest + moov
     new_data = bytearray()
     new_data.extend(data[ftyp_off:ftyp_off+ftyp_sz])
     new_data.extend(rest)
     new_data.extend(data[moov_off:moov_off+moov_sz])
 
-    # Compute how much mdat shifted safely using top-level box walker
     old_mdat_off, _ = _find_box(data, b'mdat')
     new_mdat_off, _ = _find_box(bytes(new_data), b'mdat')
     
@@ -453,18 +443,20 @@ def reloov_end(data):
     return bytes(new_data)
 
 # ==========================================
-# Main Entry Point
+# Main Entry Points
 # ==========================================
 def patch_all(data, loop_count=10):
-    """
-    Main function to apply all patches.
-    1. Inflates sample tables (stts, stsz, stsc, stco, ctts, stss)
-    2. Relocates moov to the end and fixes stco offsets
-    """
-    # Step 1: Inflate sample tables
+    """Applies all patches to raw bytes data."""
     data = inflate_sample_table_video(data, loop_count)
-    
-    # Step 2: Relocate moov to the end and adjust offsets
     data = reloov_end(data)
-    
     return data
+
+def tikquick_encode(input_data, loop_count=10):
+    """Wrapper expected by the main script. Accepts file path or bytes."""
+    if isinstance(input_data, str):
+        with open(input_data, 'rb') as f:
+            data = f.read()
+    else:
+        data = input_data
+        
+    return patch_all(data, loop_count)
