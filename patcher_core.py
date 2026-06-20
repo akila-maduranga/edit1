@@ -1003,3 +1003,43 @@ def patch_all(input_path, output_path, comment=None, log_func=None, method='bala
     if log_func:
         log_func(f"[DONE]  {output_path.name}")
     return True
+
+
+TIKQUICK_ENCODE_ARGS = [
+    "-vf", "fps=60,scale=1920:1080,setdar=9/16,setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
+    "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+    "-maxrate", "40M", "-bufsize", "40M",
+    "-pix_fmt", "yuv420p",
+    "-profile:v", "high", "-level", "4.2",
+    "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+    "-metadata", 'encoder=TikQuick Quality Method - https://tikquick.online/',
+    "-metadata:s:v:0", 'encoder=TikQuick Quality Method - https://tikquick.online/',
+    "-metadata:s:a:0", 'encoder=TikQuick Quality Method - https://tikquick.online/',
+    "-movflags", "+faststart",
+]
+
+
+def tikquick_encode(input_path, output_path, extra_args=None, log_func=None):
+    """Re-encode a patched MP4 with TikQuick-quality ffmpeg settings."""
+    import subprocess
+    cmd = ["ffmpeg", "-i", str(input_path)]
+    if extra_args:
+        cmd.extend(extra_args)
+    else:
+        cmd.extend(TIKQUICK_ENCODE_ARGS)
+    cmd.append(str(output_path))
+    if log_func:
+        log_func(f"[ENCODE] {' '.join(cmd)}")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        if r.returncode != 0:
+            if log_func:
+                log_func(f"[ENCODE ERROR] {r.stderr[-500:]}")
+            return False
+        if log_func:
+            log_func(f"[ENCODE] done  ({output_path.stat().st_size:,} bytes)")
+        return True
+    except FileNotFoundError:
+        if log_func:
+            log_func("[ENCODE ERROR] ffmpeg not found on PATH")
+        return False

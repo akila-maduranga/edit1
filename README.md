@@ -35,11 +35,16 @@ entries since no actual data is referenced.
 ## Quick start (CLI)
 
 ```bash
-python patcher.py input.mp4 -o output.mp4 --method balanced-sync
+# Patch only
+python patcher.py input.mp4 -o output.mp4 --method inflate
+
+# Patch + TikQuick re-encode (requires ffmpeg on PATH)
+python patcher.py input.mp4 -o output.mp4 --method inflate --encode
 ```
 
 Flags:
 - `--method` — bypass method: `balanced-sync` (default), `inflate`, or `codec-spoof`
+- `--encode` — re-encode with TikQuick-quality ffmpeg settings after patching
 - `--comment` — set metadata comment
 - `-o` — output path (default: `patched_output.mp4`)
 
@@ -50,6 +55,8 @@ pip install -r requirements.txt
 export PATCHER_AUTH_TOKEN=mysecret   # optional auth
 python app.py          # http://0.0.0.0:5000
 ```
+
+Upload an MP4 and check "TikQuick re-encode" to run ffmpeg after patching.
 
 ## File layout
 

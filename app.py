@@ -39,13 +39,13 @@ def require_auth():
     return None
 
 
-def run_job(job_id: str, src: Path, original_name: str, comment: str):
+def run_job(job_id: str, src: Path, original_name: str, comment: str, do_encode: bool):
     log = _job_logs[job_id]
     _job_status[job_id] = "running"
 
     stem     = Path(original_name).stem
-    out_name = f"{stem}_patched.mp4"
-    out_path = OUTPUT_DIR / f"{job_id}_{out_name}"
+    inter_name = f"{stem}_patched.mp4"
+    inter_path = OUTPUT_DIR / f"{job_id}_{inter_name}"
 
     try:
         log.put(f"[JOB]  {job_id[:8]}... started")
@@ -56,16 +56,31 @@ def run_job(job_id: str, src: Path, original_name: str, comment: str):
         def log_func(msg):
             log.put(msg)
 
-        success = patch_all(src, out_path, comment=comment, log_func=log_func, method='balanced-sync')
+        log.put("[STEP] Patching...")
+        success = patch_all(src, inter_path, comment=comment, log_func=log_func, method='inflate')
 
-        if success:
-            _job_output[job_id] = f"{job_id}_{out_name}"
+        if success and do_encode:
+            log.put("[STEP] Re-encoding with TikQuick quality...")
+            from patcher_core import tikquick_encode
+            final_name = f"{stem}_tikquick.mp4"
+            final_path = OUTPUT_DIR / f"{job_id}_{final_name}"
+            encode_ok = tikquick_encode(inter_path, final_path, log_func=log_func)
+            inter_path.unlink(missing_ok=True)
+            if encode_ok:
+                _job_output[job_id] = f"{job_id}_{final_name}"
+                _job_status[job_id] = "done"
+            else:
+                _job_status[job_id] = "error"
+        elif success:
+            _job_output[job_id] = f"{job_id}_{inter_name}"
             _job_status[job_id] = "done"
         else:
             _job_status[job_id] = "error"
 
     except Exception as exc:
+        import traceback
         log.put(f"[ERROR] {exc}")
+        log.put(traceback.format_exc()[-300:])
         _job_status[job_id] = "error"
     finally:
         try: src.unlink(missing_ok=True)
@@ -108,6 +123,7 @@ def upload():
         return jsonify({"error": "Only .mp4 files accepted"}), 400
 
     comment = request.form.get("comment", "")
+    do_encode = request.form.get("encode", "").lower() in ("1", "true", "yes", "on")
     job_id  = str(uuid.uuid4())
     dest    = UPLOAD_DIR / f"{job_id}_input.mp4"
     f.save(dest)
@@ -115,8 +131,8 @@ def upload():
     _cleanup_jobs()
     _job_logs[job_id] = queue.Queue()
     _job_created[job_id] = time.time()
-    threading.Thread(target=run_job, args=(job_id, dest, f.filename, comment), daemon=True).start()
-    return jsonify({"job_id": job_id})
+    threading.Thread(target=run_job, args=(job_id, dest, f.filename, comment, do_encode), daemon=True).start()
+    return jsonify({"job_id": job_id, "encode": do_encode})
 
 
 @app.route("/stream/<job_id>")
